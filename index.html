@@ -90,14 +90,14 @@
   #scrollWrap {
     position: absolute;
     inset: 0;
-    overflow-x: auto;
+    overflow-x: hidden; /* ★iPad実機で指のネイティブスクロールと描画イベントが競合したため、
+                            ブラウザ任せのスクロールはやめ、JSでscrollLeftを直接動かす方式に変更 */
     overflow-y: hidden;
-    -webkit-overflow-scrolling: touch;
   }
   #sheetCanvas {
     display: block;
     background: #ffffff; /* Canvas自体は紙のイメージで常に白 */
-    touch-action: pan-x; /* 指でのスワイプは横スクロールに使う(描画はペン/マウスのみ) */
+    touch-action: none; /* 指の挙動(描画/パン)は全てJS側で判定・処理する */
   }
 </style>
 </head>
@@ -200,9 +200,10 @@ let canvas, ctx, scrollWrap;
 let dpr = window.devicePixelRatio || 1;
 let PAGE_W = 0, BLOCK_W = 0, CANVAS_W_CSS = 0, CANVAS_H_CSS = 0, GRID_H = 0;
 
-let drawing = false;
-let lastX = 0, lastY = 0;
-let scrollLocked = false; // ★「固定」ボタンで切替。固定中は横スクロールを止めて指でも描画できるようにする
+let mode = null; // 現在進行中のポインタ操作: "draw"(描画) | "pan"(横スクロール) | null
+let lastX = 0, lastY = 0;             // 描画時: Canvas内座標(CSS px)
+let lastPanClientX = 0;               // パン時: 画面(viewport)基準のX座標
+let scrollLocked = false; // ★「固定」ボタンで切替。固定中は指も描画に使う(パンは無効)
 
 function currentWheelOrder() {
   return WHEEL_ORDER_TABLE[parseInt(el("wheelOrder").value, 10)];
@@ -368,48 +369,66 @@ function scrollToLatest() {
 }
 
 // -----------------------------------------------------------------
-// 手書き入力(Pointer Events)。指(touch)は横スクロールに使うため描画対象外。
+// 手書き入力(Pointer Events)。
+//
+// ★iPad実機(Safari標準/Bluefy/Chrome、いずれもWebKitベース)で検証したところ、
+//   touch-action(CSS)やtouchstart/touchmoveのpreventDefault()だけでは、指で触れた
+//   瞬間にブラウザ側が先にスクロールとして処理してしまい、描画イベントが機能しない
+//   ことが判明した。そのため、ブラウザ任せの横スクロール(touch-actionでの制御)は
+//   完全にやめ、横スクロールの実現方法そのものをJS側での手動制御(scrollWrap.scrollLeftの
+//   直接操作)に切り替えている。これにより「指の挙動は常にこちらで判定・処理する」ことが
+//   でき、ブラウザ側のジェスチャー判定と競合しなくなる。
+//   - ペン/マウス: 常に描画。
+//   - 指(touch): 「固定」ボタンがOFFの間はパン(横スクロール)、ONの間は描画。
 // -----------------------------------------------------------------
 function getPos(e) {
   const rect = canvas.getBoundingClientRect();
   return { x: e.clientX - rect.left, y: e.clientY - rect.top };
 }
 
-function canDraw(e) {
-  // ペン/マウスは常に描画。指(touch)は「固定」中のみ描画対象(それ以外はスクロールに使う)。
-  return e.pointerType !== "touch" || scrollLocked;
-}
-
 function onPointerDown(e) {
-  if (!canDraw(e)) return;
   e.preventDefault();
-  drawing = true;
   canvas.setPointerCapture(e.pointerId);
+
+  if (e.pointerType === "touch" && !scrollLocked) {
+    mode = "pan";
+    lastPanClientX = e.clientX;
+    return;
+  }
+
+  mode = "draw";
   const p = getPos(e);
   lastX = p.x; lastY = p.y;
 }
 
 function onPointerMove(e) {
-  if (!drawing || !canDraw(e)) return;
-  e.preventDefault();
-  const p = getPos(e);
-  ctx.save();
-  ctx.strokeStyle = "#111111";
-  ctx.lineWidth = 2;
-  ctx.lineCap = "round";
-  ctx.lineJoin = "round";
-  ctx.beginPath();
-  ctx.moveTo(lastX, lastY);
-  ctx.lineTo(p.x, p.y);
-  ctx.stroke();
-  ctx.restore();
-  lastX = p.x; lastY = p.y;
+  if (mode === "pan") {
+    e.preventDefault();
+    const delta = e.clientX - lastPanClientX;
+    scrollWrap.scrollLeft -= delta;
+    lastPanClientX = e.clientX;
+    return;
+  }
+  if (mode === "draw") {
+    e.preventDefault();
+    const p = getPos(e);
+    ctx.save();
+    ctx.strokeStyle = "#111111";
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(lastX, lastY);
+    ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+    ctx.restore();
+    lastX = p.x; lastY = p.y;
+  }
 }
 
 function onPointerEnd(e) {
-  if (!drawing) return;
-  drawing = false;
-  saveState();
+  if (mode === "draw") saveState();
+  mode = null;
 }
 
 function toggleScrollLock() {
@@ -418,12 +437,12 @@ function toggleScrollLock() {
   if (scrollLocked) {
     btn.textContent = "固定中";
     btn.classList.add("active");
-    canvas.style.touchAction = "none"; // 指のドラッグもブラウザの横スクロールに渡さず、描画として使う
   } else {
     btn.textContent = "固定";
     btn.classList.remove("active");
-    canvas.style.touchAction = "pan-x"; // 指のドラッグは横スクロールに戻す
   }
+  // 指の挙動(パン/描画)の切替はonPointerDown側でscrollLockedを見て判定しているので、
+  // ここではボタンの見た目を変えるだけで良い。
 }
 
 // -----------------------------------------------------------------
@@ -629,12 +648,14 @@ async function init() {
   canvas.addEventListener("pointerup", onPointerEnd);
   canvas.addEventListener("pointercancel", onPointerEnd);
   canvas.addEventListener("pointerleave", onPointerEnd);
-  // ★Safari系ブラウザではtouch-action:noneをJSで動的に切り替えても、指で触れた瞬間に
-  //   先に横スクロールとして処理されてしまい、pointer系イベントがpointercancelで
-  //   打ち切られることがある。ネイティブのtouchstart/touchmoveでも{passive:false}で
-  //   明示的にpreventDefault()しておくことで、固定中は確実にスクロールを止める(二重対策)。
-  canvas.addEventListener("touchstart", (e) => { if (scrollLocked) e.preventDefault(); }, { passive: false });
-  canvas.addEventListener("touchmove", (e) => { if (scrollLocked) e.preventDefault(); }, { passive: false });
+
+  // ★PC(マウス+トラックパッド/ホイール)での動作確認用。touch-action:noneで指のネイティブ
+  //   スクロールを完全に止めた関係で、実機(タブレット)以外ではスクロール手段が無くなって
+  //   しまうため、ホイール操作でも横スクロールできるようにしておく。
+  scrollWrap.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    scrollWrap.scrollLeft += (e.deltaX !== 0 ? e.deltaX : e.deltaY);
+  }, { passive: false });
 
   el("connectBtn").addEventListener("click", () => {
     if (bleDevice && bleDevice.gatt.connected) disconnect();
