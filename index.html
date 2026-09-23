@@ -15,11 +15,16 @@
     background: #111318;
     color: #eee;
   }
+  body {
+    display: flex;
+    flex-direction: column; /* ヘッダー(可変高さ)+Canvas領域(残り全部)を縦積みにする */
+  }
   #header {
     display: flex;
     align-items: center;
     gap: 8px;
     flex-wrap: wrap;
+    flex: 0 0 auto;
     padding: 8px 10px;
     background: #1a1c22;
     border-bottom: 1px solid #2a2d38;
@@ -68,6 +73,7 @@
     margin-left: auto;
   }
   #sendStatus {
+    flex: 0 0 auto;
     font-size: 11px;
     color: #888;
     padding: 4px 10px;
@@ -75,9 +81,14 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  #canvasArea {
+    flex: 1 1 auto; /* ヘッダー/ステータス行の残り高さを丸ごと使う */
+    position: relative;
+    min-height: 0; /* flexアイテムの縮小を正しく効かせるために必要 */
+  }
   #scrollWrap {
     position: absolute;
-    top: 0; left: 0; right: 0; bottom: 0;
+    inset: 0;
     overflow-x: auto;
     overflow-y: hidden;
     -webkit-overflow-scrolling: touch;
@@ -86,11 +97,6 @@
     display: block;
     background: #ffffff; /* Canvas自体は紙のイメージで常に白 */
     touch-action: pan-x; /* 指でのスワイプは横スクロールに使う(描画はペン/マウスのみ) */
-  }
-  #canvasArea {
-    position: absolute;
-    top: 0; left: 0; right: 0; bottom: 0;
-    padding-top: 44px; /* ヘッダー高さぶん */
   }
 </style>
 </head>
@@ -217,7 +223,10 @@ function setupCanvas() {
   PAGE_W = Math.max(600, Math.round(window.innerWidth));
   BLOCK_W = PAGE_W / BLOCKS_PER_PAGE;
   CANVAS_W_CSS = BLOCK_W * MAX_BLOCKS;
-  CANVAS_H_CSS = Math.max(300, window.innerHeight - 44);
+  // ヘッダー/ステータス行の実高さを差し引いた「残り全部」がCanvas領域の高さ(flexboxで確保済み)。
+  // 固定値(44pxなど)を仮定すると、ヘッダーが折り返した時にボタンが隠れるバグの原因になるため、
+  // 実測値(#canvasAreaのclientHeight)を使う。
+  CANVAS_H_CSS = Math.max(300, el("canvasArea").clientHeight);
   GRID_H = CANVAS_H_CSS * 0.5;
 
   canvas.style.width = CANVAS_W_CSS + "px";
