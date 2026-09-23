@@ -144,12 +144,33 @@
     gap: 8px;
   }
   .modal-actions button { width: 100%; }
+  .photo-view-box {
+    background: #1a1c22;
+    border: 1px solid #2a2d38;
+    border-radius: 12px;
+    padding: 14px;
+    width: min(92vw, 640px);
+  }
+  .photo-view-box img {
+    display: block;
+    width: 100%;
+    max-height: 70vh;
+    object-fit: contain;
+    border-radius: 6px;
+    margin-bottom: 14px;
+    background: #000;
+  }
+  .photo-view-actions {
+    display: flex;
+    gap: 8px;
+  }
+  .photo-view-actions button { flex: 1 1 0; }
 </style>
 </head>
 <body>
 
 <div id="header">
-  <h1>TPU-MINI 手書き</h1>
+  <h1>TPU-MINI 手書き <span id="buildTag" style="font-size:10px;color:#777;font-weight:normal;"></span></h1>
   <button id="connectBtn" class="primary">接続</button>
   <span id="connStatus" class="status disconnected">未接続</span>
   <span id="liveInfo">--.- kPa / MODE: -</span>
@@ -184,6 +205,16 @@
       <button id="modalSendThenNew" class="primary">送信してから新規</button>
       <button id="modalNewWithoutSend" class="danger">送信せず新規</button>
       <button id="modalCancel">キャンセル</button>
+    </div>
+  </div>
+</div>
+
+<div id="photoViewModal" class="modal-overlay">
+  <div class="photo-view-box">
+    <img id="photoViewImg" alt="タイヤ写真">
+    <div class="photo-view-actions">
+      <button id="photoViewRetake" class="danger">撮り直す</button>
+      <button id="photoViewClose" class="primary">閉じる</button>
     </div>
   </div>
 </div>
@@ -254,6 +285,11 @@ const WHEEL_ORDER_TABLE = [
   ["RL", "RR", "FR", "FL"],
   ["RR", "RL", "FL", "FR"],
 ];
+
+// ★どのバージョンのファイルを開いているか実機側で見分けられるよう、画面に小さく表示する
+//   (「新しいファイルを送ったのに変化がない」という時、古いファイルを開いたままになっていないか
+//   確認しやすくするための目印。変更のたびにここを更新する)。
+const BUILD_TAG = "v6.1 写真ビューア追加";
 
 const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
 const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
@@ -398,6 +434,10 @@ function makeCanvasEl() {
   return { canvas: c, ctx };
 }
 
+function freshPhotoFilledState() {
+  return { FL: false, FR: false, RL: false, RR: false };
+}
+
 // まだ測定値が無い空のページを1枚作る(アプリ起動直後や「新規」直後に用意しておく)。
 // BLE接続前でも手書き/写真だけ先に試せるようにするための土台で、値は「--.-」表示のまま。
 // これ自体は測定1回分としてカウントしない(BLEで4輪揃うと別途createMeasuredPageで
@@ -407,7 +447,7 @@ function createEmptyPage() {
   paintPageBackground(canvas, ctx);
   drawGridBox(ctx, { FL: null, FR: null, RL: null, RR: null }, "");
   ["FL", "FR", "RL", "RR"].forEach(w => drawPhotoPlaceholder(ctx, w, PHOTO_RECTS[w]));
-  const page = { canvas, ctx };
+  const page = { canvas, ctx, photoFilled: freshPhotoFilledState() };
   attachInputHandlers(canvas, page);
   pages.push(page);
   return page;
@@ -419,16 +459,17 @@ function createMeasuredPage(values, timestampStr) {
   paintPageBackground(canvas, ctx);
   drawGridBox(ctx, values, timestampStr);
   ["FL", "FR", "RL", "RR"].forEach(w => drawPhotoPlaceholder(ctx, w, PHOTO_RECTS[w]));
-  const page = { canvas, ctx };
+  const page = { canvas, ctx, photoFilled: freshPhotoFilledState() };
   attachInputHandlers(canvas, page);
   pages.push(page);
   return page;
 }
 
-// 復元用: 中身はcreateImageBitmapで丸ごと上書きするので、ここでは器だけ作る
+// 復元用: 中身はcreateImageBitmapで丸ごと上書きするので、ここでは器だけ作る。
+// photoFilledは復元後にloadState側でrec.pageMetaから上書きする(無ければ全falseのまま)。
 function createBlankPageForRestore() {
   const { canvas, ctx } = makeCanvasEl();
-  const page = { canvas, ctx };
+  const page = { canvas, ctx, photoFilled: freshPhotoFilledState() };
   attachInputHandlers(canvas, page);
   pages.push(page);
   return page;
@@ -558,7 +599,12 @@ function onPointerEnd(e) {
   if (mode !== "draw") return;
   if (!moved) {
     const wheel = hitTestPhoto(downX, downY);
-    if (wheel) openCameraFor(activePage, wheel);
+    if (wheel) {
+      // 撮影済みのエリアは拡大表示(タップのたびに撮り直しになってしまうのを避ける)。
+      // 未撮影のエリアはこれまで通りタップで直接カメラを起動する。
+      if (activePage.photoFilled[wheel]) openPhotoViewer(activePage, wheel);
+      else openCameraFor(activePage, wheel);
+    }
   } else {
     hasContent = true;
     saveState();
@@ -568,12 +614,33 @@ function onPointerEnd(e) {
 }
 
 // -----------------------------------------------------------------
-// タイヤ写真の撮影・合成
+// タイヤ写真の撮影・合成・拡大表示
 // -----------------------------------------------------------------
 function openCameraFor(page, wheel) {
   pendingPhotoTarget = { page, wheel };
   el("photoInput").value = ""; // 同じファイルを連続選択してもchangeが発火するようにリセット
   el("photoInput").click();
+}
+
+let photoViewTarget = null; // { page, wheel }
+
+// 該当エリアだけをCanvasから切り出して拡大表示する(元写真は保持していないため、
+// 既にページCanvasへ焼き込まれたピクセルをそのまま切り出す)。
+function openPhotoViewer(page, wheel) {
+  const rect = PHOTO_RECTS[wheel];
+  const sx = Math.round(rect.x * dpr), sy = Math.round(rect.y * dpr);
+  const sw = Math.round(rect.w * dpr), sh = Math.round(rect.h * dpr);
+  const tmp = document.createElement("canvas");
+  tmp.width = sw; tmp.height = sh;
+  tmp.getContext("2d").drawImage(page.canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+  el("photoViewImg").src = tmp.toDataURL("image/png");
+  photoViewTarget = { page, wheel };
+  el("photoViewModal").style.display = "flex";
+}
+
+function closePhotoViewer() {
+  el("photoViewModal").style.display = "none";
+  photoViewTarget = null;
 }
 
 function loadImageFromFile(file) {
@@ -611,6 +678,7 @@ async function drawPhotoIntoPage(page, wheel, file) {
   ctx.shadowBlur = 3;
   ctx.fillText(wheel, rect.x + 4, rect.y + 4);
   ctx.restore();
+  page.photoFilled[wheel] = true;
 }
 
 el("photoInput").addEventListener("change", async (e) => {
@@ -643,14 +711,16 @@ function openDb() {
 async function saveState() {
   try {
     const pageBlobs = [];
+    const pageMeta = [];
     for (const p of pages) {
       const blob = await new Promise(res => p.canvas.toBlob(res, "image/png"));
       pageBlobs.push(blob);
+      pageMeta.push({ photoFilled: p.photoFilled });
     }
     const db = await openDb();
     await new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, "readwrite");
-      tx.objectStore(STORE_NAME).put({ pageBlobs, currentPageIdx, hasContent, savedAt: Date.now() }, STATE_KEY);
+      tx.objectStore(STORE_NAME).put({ pageBlobs, pageMeta, currentPageIdx, hasContent, savedAt: Date.now() }, STATE_KEY);
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
     });
@@ -676,6 +746,8 @@ async function loadState() {
         page.ctx.setTransform(1, 0, 0, 1, 0, 0);
         page.ctx.drawImage(bitmap, 0, 0);
         page.ctx.restore();
+        const meta = rec.pageMeta && rec.pageMeta[i];
+        if (meta && meta.photoFilled) page.photoFilled = meta.photoFilled;
       }
       const restoreIdx = Math.min(Math.max(0, rec.currentPageIdx ?? 0), pages.length - 1);
       showPage(restoreIdx);
@@ -890,6 +962,9 @@ function disconnect() {
 // 初期化
 // -----------------------------------------------------------------
 async function init() {
+  el("buildTag").textContent = `(${BUILD_TAG})`;
+  console.log("[TPU-MINI handwriting] build:", BUILD_TAG);
+
   setupLayout();
   await loadState();
 
@@ -930,6 +1005,13 @@ async function init() {
     } else {
       alert("送信に失敗したため、新規は中止しました。もう一度お試しください。");
     }
+  });
+
+  el("photoViewClose").addEventListener("click", closePhotoViewer);
+  el("photoViewRetake").addEventListener("click", () => {
+    const target = photoViewTarget;
+    closePhotoViewer();
+    if (target) openCameraFor(target.page, target.wheel);
   });
 
   resetWheelCollector();
