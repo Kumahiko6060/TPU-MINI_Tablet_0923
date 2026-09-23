@@ -186,8 +186,22 @@
 //   横スクロールはscrollWrap.scrollLeftをJSで直接操作する(#scrollWrapはoverflow-x:auto。
 //   overflow:hiddenにするとiOS SafariでscrollLeft代入が反映されないことがあるため要注意)。
 //
+// ★第5版での変更点(現在の方式):
+//   第4版(指の本数で描画/パンを判定する方式)は、PC上のChromiumシミュレータでは
+//   正常動作を確認したが、iPad実機(Chrome)で「1本指の描画は正常、2本目の指は
+//   完全に無反応(パンも起きない)」という症状が出た。これはPointer Events APIの
+//   マルチタッチ対応がWebKit(iOS Safari/Chrome/Bluefyは全てWebKitベース)で
+//   不安定であることが既知の制約としてあり、Blink(Chromium)との実装差が原因と
+//   判断した。
+//   そこで、Pointer Eventsでのマルチタッチ判定をやめ、より古くから多点タッチで
+//   安定しているTouch Events API(touchstart/touchmove/touchendとe.touches/
+//   e.changedTouches)に切り替えた。指(touch)の描画・パン判定はTouch Events側で
+//   完結させ、Pointer Eventsはマウス/ペン入力の描画専用として残している
+//   (pointerType==="touch"の場合はPointer Events側では何もしない)。
+//   判定方式自体(1本指=描画、2本目が触れたらパンに切替)は第4版から変更なし。
+//
 // ★未確認・要実機再確認の項目:
-//   - 今回の修正(2本指パン方式)でiPad実機の横スクロールが直るかどうか。
+//   - 今回の修正(Touch Events方式)でiPad実機の2本指パンが直るかどうか。
 //   - ページ分割によるCanvas描画・区切り線表示・1本指での手書きは前回までの修正で
 //     改善済み(実機で確認取れた)。
 //   - ブロック上限(50)に達した場合の挙動(現状は警告を出して以降の自動追記を止めるだけ)。
@@ -236,12 +250,18 @@ let PAGE_W_CSS = 0, PAGE_H_CSS = 0, BLOCK_W_CSS = 0, GRID_H = 0;
 
 let pages = []; // pages[pageIdx] = { canvas, ctx } ※実際に使われた分だけ生成する
 
-let mode = null; // 現在進行中のポインタ操作: "draw"(描画) | "pan"(2本指での横スクロール) | null
+// ★ペン/マウス用(Pointer Events)。指(touch)はここでは扱わない(下のTouch Events側で処理)。
+let mode = null; // "draw" | null
 let lastX = 0, lastY = 0;             // 描画時: 対象Canvas内座標(CSS px)
 let activeCanvas = null, activeCtx = null; // 現在描画中のページCanvas
-let activeTouchIds = new Set();       // 現在触れている指(touchポインタ)のID一覧
-let panPointerId = null;              // パン中、どの指の動きを基準にするか
-let panLastClientX = 0;               // パン時: 画面(viewport)基準のX座標
+
+// ★指(touch)用(Touch Events)。1本指=描画、2本目が触れたらパンに切替。
+let touchMode = null;      // "draw" | "pan" | null
+let drawTouchId = null;    // 描画中の指のidentifier
+let touchLastX = 0, touchLastY = 0;   // 描画時: 対象Canvas内座標(CSS px)
+let touchActiveCanvas = null, touchActiveCtx = null;
+let panTouchId = null;     // パン中、どの指の動きを基準にするか(identifier)
+let panLastClientX = 0;    // パン時: 画面(viewport)基準のX座標
 
 function currentWheelOrder() {
   return WHEEL_ORDER_TABLE[parseInt(el("wheelOrder").value, 10)];
@@ -298,11 +318,17 @@ function drawPageGuides(ctx) {
 }
 
 function attachPointerHandlers(canvasEl) {
+  // マウス/ペン(Pointer Events)。指(touch)はここでは無視し、Touch Events側で処理する。
   canvasEl.addEventListener("pointerdown", (e) => onPointerDown(e, canvasEl));
   canvasEl.addEventListener("pointermove", onPointerMove);
   canvasEl.addEventListener("pointerup", onPointerEnd);
   canvasEl.addEventListener("pointercancel", onPointerEnd);
   canvasEl.addEventListener("pointerleave", onPointerEnd);
+  // 指(touch, Touch Events)。WebKitでのPointer Eventsマルチタッチ不安定問題を避けるため。
+  canvasEl.addEventListener("touchstart", (e) => onTouchStart(e, canvasEl), { passive: false });
+  canvasEl.addEventListener("touchmove", (e) => onTouchMove(e, canvasEl), { passive: false });
+  canvasEl.addEventListener("touchend", (e) => onTouchEnd(e, canvasEl), { passive: false });
+  canvasEl.addEventListener("touchcancel", (e) => onTouchCancel(e, canvasEl), { passive: false });
 }
 
 function createPageCanvas(pageIdx) {
@@ -423,88 +449,138 @@ function scrollToLatest() {
 }
 
 // -----------------------------------------------------------------
-// 手書き入力(Pointer Events)。
-//   - ペン/マウス: 常に描画。
-//   - 指(touch) 1本: 描画。
-//   - 指(touch) 2本以上: パン(横スクロール)。2本目が触れた時点で、1本目による
-//     描画中だった場合はそこで打ち切ってパンへ切り替える。
-//   1本指ドラッグの意図(描画かスクロールか)をブラウザ側の挙動やtouch-action任せで
-//   判別させるとiPad実機で安定しなかった(第2版・第3版の経緯を参照)ため、
-//   「触れている指の本数」という曖昧さのない基準で、常にJS側だけで判定する方式にした。
+// 手書き入力。
+//   - ペン/マウス: Pointer Eventsで常に描画。
+//   - 指(touch): Touch Eventsで判定する(WebKitはPointer Eventsのマルチタッチ対応が
+//     不安定なため、指の扱いはTouch Events APIに分離した。第5版のコメント参照)。
+//       1本: 描画。2本以上: パン(横スクロール)。2本目が触れた時点で、1本目による
+//       描画中だった場合はそこで打ち切ってパンへ切り替える。
 //   横スクロールはscrollWrap.scrollLeftを直接操作する(#scrollWrapがoverflow:autoなので
 //   反映される。overflow:hiddenだと反映されないことがあるため注意)。
 // -----------------------------------------------------------------
-function getPos(e, canvasEl) {
+function getPos(clientX, clientY, canvasEl) {
   const rect = canvasEl.getBoundingClientRect();
-  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  return { x: clientX - rect.left, y: clientY - rect.top };
 }
 
-function onPointerDown(e, canvasEl) {
-  e.preventDefault();
+function strokeLine(ctx, x0, y0, x1, y1) {
+  ctx.save();
+  ctx.strokeStyle = "#111111";
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x1, y1);
+  ctx.stroke();
+  ctx.restore();
+}
 
-  if (e.pointerType === "touch") {
-    activeTouchIds.add(e.pointerId);
-    if (activeTouchIds.size >= 2) {
-      // 2本目の指が触れた → パンに切り替える(描画中だった場合はそこで打ち切り)
-      mode = "pan";
-      panPointerId = e.pointerId;
-      panLastClientX = e.clientX;
-      activeCanvas = null;
-      activeCtx = null;
-      return;
-    }
+function touchListFind(list, id) {
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].identifier === id) return list[i];
   }
+  return null;
+}
 
+// --- ペン/マウス(Pointer Events)。指(touch)はここでは扱わない ---
+function onPointerDown(e, canvasEl) {
+  if (e.pointerType === "touch") return; // 指はTouch Events側で処理
+  e.preventDefault();
   canvasEl.setPointerCapture(e.pointerId);
   mode = "draw";
   activeCanvas = canvasEl;
   activeCtx = canvasEl.getContext("2d");
-  const p = getPos(e, canvasEl);
+  const p = getPos(e.clientX, e.clientY, canvasEl);
   lastX = p.x; lastY = p.y;
 }
 
 function onPointerMove(e) {
-  if (mode === "pan") {
-    if (e.pointerId !== panPointerId) return; // パンの基準にしている指以外は無視
-    e.preventDefault();
-    const delta = e.clientX - panLastClientX;
-    scrollWrap.scrollLeft -= delta;
-    panLastClientX = e.clientX;
-    return;
-  }
+  if (e.pointerType === "touch") return;
   if (mode === "draw" && activeCtx) {
     e.preventDefault();
-    const p = getPos(e, activeCanvas);
-    activeCtx.save();
-    activeCtx.strokeStyle = "#111111";
-    activeCtx.lineWidth = 2;
-    activeCtx.lineCap = "round";
-    activeCtx.lineJoin = "round";
-    activeCtx.beginPath();
-    activeCtx.moveTo(lastX, lastY);
-    activeCtx.lineTo(p.x, p.y);
-    activeCtx.stroke();
-    activeCtx.restore();
+    const p = getPos(e.clientX, e.clientY, activeCanvas);
+    strokeLine(activeCtx, lastX, lastY, p.x, p.y);
     lastX = p.x; lastY = p.y;
   }
 }
 
 function onPointerEnd(e) {
-  if (e.pointerType === "touch") activeTouchIds.delete(e.pointerId);
-
-  if (mode === "pan") {
-    if (e.pointerId === panPointerId) {
-      mode = null;
-      panPointerId = null;
-    }
-    return;
-  }
+  if (e.pointerType === "touch") return;
   if (mode === "draw") {
     saveState();
     mode = null;
     activeCanvas = null;
     activeCtx = null;
   }
+}
+
+// --- 指(Touch Events)。1本=描画、2本以上=パン ---
+function onTouchStart(e, canvasEl) {
+  e.preventDefault();
+  const touches = e.targetTouches; // このcanvasEl上で現在触れている指のみ
+
+  if (touches.length >= 2) {
+    // 2本目の指が触れた → パンに切り替える(描画中だった場合はそこで打ち切り)
+    touchMode = "pan";
+    const t = touches[touches.length - 1];
+    panTouchId = t.identifier;
+    panLastClientX = t.clientX;
+    touchActiveCanvas = null;
+    touchActiveCtx = null;
+    return;
+  }
+
+  touchMode = "draw";
+  const t = touches[0];
+  drawTouchId = t.identifier;
+  touchActiveCanvas = canvasEl;
+  touchActiveCtx = canvasEl.getContext("2d");
+  const p = getPos(t.clientX, t.clientY, canvasEl);
+  touchLastX = p.x; touchLastY = p.y;
+}
+
+function onTouchMove(e, canvasEl) {
+  e.preventDefault();
+  if (touchMode === "pan") {
+    const t = touchListFind(e.targetTouches, panTouchId);
+    if (!t) return;
+    const delta = t.clientX - panLastClientX;
+    scrollWrap.scrollLeft -= delta;
+    panLastClientX = t.clientX;
+    return;
+  }
+  if (touchMode === "draw" && touchActiveCtx) {
+    const t = touchListFind(e.targetTouches, drawTouchId);
+    if (!t) return;
+    const p = getPos(t.clientX, t.clientY, touchActiveCanvas);
+    strokeLine(touchActiveCtx, touchLastX, touchLastY, p.x, p.y);
+    touchLastX = p.x; touchLastY = p.y;
+  }
+}
+
+function resetTouchGesture() {
+  touchMode = null;
+  drawTouchId = null;
+  panTouchId = null;
+  touchActiveCanvas = null;
+  touchActiveCtx = null;
+}
+
+function onTouchEnd(e, canvasEl) {
+  if (touchMode === "pan" && touchListFind(e.changedTouches, panTouchId)) {
+    resetTouchGesture();
+    return;
+  }
+  if (touchMode === "draw" && touchListFind(e.changedTouches, drawTouchId)) {
+    saveState();
+    resetTouchGesture();
+  }
+}
+
+function onTouchCancel(e, canvasEl) {
+  // 割り込み(電話着信など)発生時は状態をリセットするだけにする(念のためsaveStateはしない)
+  resetTouchGesture();
 }
 
 // -----------------------------------------------------------------
