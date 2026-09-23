@@ -44,6 +44,7 @@
   }
   button.primary { background: #2f6fed; border-color: #2f6fed; }
   button.danger { background: #4a2323; border-color: #7a3a3a; }
+  button.active { background: #7a5a12; border-color: #c98a1a; }
   button:disabled { opacity: 0.4; }
   select {
     font-size: 13px;
@@ -115,6 +116,7 @@
     <option value="4">RR始点</option>
   </select>
   <span id="blockCount">0/50</span>
+  <button id="lockBtn">固定</button>
   <button id="newBtn" class="danger">新規</button>
   <button id="sendBtn" class="primary">送信</button>
 </div>
@@ -147,10 +149,9 @@
 //   - アプリを開き直しても、明示的に「新規」ボタンを押さない限り前回の続きから使える。
 //     ブラウザのIndexedDBにCanvas全体を画像として保存・復元する(ベクターデータではなく
 //     ビットマップとして保存する簡易な方式)。
-//   - 手書きの入力はPointer Eventsで取得するが、指(touch)は横スクロールに使うため、
-//     描画として扱うのはペン/スタイラス(pointerType "pen")とマウス("mouse", 動作確認用)
-//     のみに限定している。これは会話の中で明示的に決めた内容ではなく、「指でスクロール」
-//     という方針から実装上の帰結として採用した割り当てなので、実機で使いにくければ調整すること。
+//   - 手書きはPointer Eventsで取得。通常時、指(touch)は横スクロールに使い、描画はペン/
+//     マウスのみ。ヘッダーの「固定」ボタンを押すと横スクロールが止まり、指でも描画できる
+//     ようになる(1本指ドラッグが「線を引く」か「スクロールする」か曖昧になる問題への対処)。
 //   - 対象端末はiPad(Bluefy等が必要)・Androidタブレット両方、横向き(ランドスケープ)使用。
 //
 // ★未確定・要実機確認の項目:
@@ -201,6 +202,7 @@ let PAGE_W = 0, BLOCK_W = 0, CANVAS_W_CSS = 0, CANVAS_H_CSS = 0, GRID_H = 0;
 
 let drawing = false;
 let lastX = 0, lastY = 0;
+let scrollLocked = false; // ★「固定」ボタンで切替。固定中は横スクロールを止めて指でも描画できるようにする
 
 function currentWheelOrder() {
   return WHEEL_ORDER_TABLE[parseInt(el("wheelOrder").value, 10)];
@@ -373,8 +375,13 @@ function getPos(e) {
   return { x: e.clientX - rect.left, y: e.clientY - rect.top };
 }
 
+function canDraw(e) {
+  // ペン/マウスは常に描画。指(touch)は「固定」中のみ描画対象(それ以外はスクロールに使う)。
+  return e.pointerType !== "touch" || scrollLocked;
+}
+
 function onPointerDown(e) {
-  if (e.pointerType === "touch") return;
+  if (!canDraw(e)) return;
   e.preventDefault();
   drawing = true;
   canvas.setPointerCapture(e.pointerId);
@@ -383,7 +390,7 @@ function onPointerDown(e) {
 }
 
 function onPointerMove(e) {
-  if (!drawing || e.pointerType === "touch") return;
+  if (!drawing || !canDraw(e)) return;
   e.preventDefault();
   const p = getPos(e);
   ctx.save();
@@ -403,6 +410,20 @@ function onPointerEnd(e) {
   if (!drawing) return;
   drawing = false;
   saveState();
+}
+
+function toggleScrollLock() {
+  scrollLocked = !scrollLocked;
+  const btn = el("lockBtn");
+  if (scrollLocked) {
+    btn.textContent = "固定中";
+    btn.classList.add("active");
+    canvas.style.touchAction = "none"; // 指のドラッグもブラウザの横スクロールに渡さず、描画として使う
+  } else {
+    btn.textContent = "固定";
+    btn.classList.remove("active");
+    canvas.style.touchAction = "pan-x"; // 指のドラッグは横スクロールに戻す
+  }
 }
 
 // -----------------------------------------------------------------
@@ -614,6 +635,7 @@ async function init() {
     else connect();
   });
   el("wheelOrder").addEventListener("change", resetWheelCollector);
+  el("lockBtn").addEventListener("click", toggleScrollLock);
   el("newBtn").addEventListener("click", startNew);
   el("sendBtn").addEventListener("click", sendToGas);
 
