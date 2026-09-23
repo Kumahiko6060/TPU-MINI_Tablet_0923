@@ -10,7 +10,7 @@
   html, body {
     margin: 0;
     height: 100%;
-    overflow: hidden; /* ページ自体はスクロールさせない。スクロールするのはCanvas領域の横方向のみ */
+    overflow: hidden;
     font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
     background: #111318;
     color: #eee;
@@ -44,8 +44,7 @@
   }
   button.primary { background: #2f6fed; border-color: #2f6fed; }
   button.danger { background: #4a2323; border-color: #7a3a3a; }
-  button.active { background: #7a5a12; border-color: #c98a1a; }
-  button:disabled { opacity: 0.4; }
+  button:disabled { opacity: 0.35; }
   select {
     font-size: 13px;
     padding: 6px 8px;
@@ -67,11 +66,18 @@
     color: #aaa;
     white-space: nowrap;
   }
-  #blockCount {
-    font-size: 12px;
-    color: #aaa;
-    white-space: nowrap;
+  #pageNav {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     margin-left: auto;
+  }
+  #pageIndicator {
+    font-size: 12px;
+    color: #ddd;
+    min-width: 54px;
+    text-align: center;
+    white-space: nowrap;
   }
   #sendStatus {
     flex: 0 0 auto;
@@ -83,30 +89,61 @@
     text-overflow: ellipsis;
   }
   #canvasArea {
-    flex: 1 1 auto; /* ヘッダー/ステータス行の残り高さを丸ごと使う */
+    flex: 1 1 auto;
     position: relative;
-    min-height: 0; /* flexアイテムの縮小を正しく効かせるために必要 */
+    min-height: 0;
   }
-  #scrollWrap {
+  #pagesHost {
     position: absolute;
     inset: 0;
-    overflow-x: auto;  /* ★"hidden"ではなく"auto"にしておく必要がある。iOS Safariでは
-                            overflow:hiddenな要素へのJSでのscrollLeft代入が反映されないことが
-                            あるため(横スクロールはネイティブに任せず、下記の2本指パンで
-                            JSがscrollLeftを直接操作する)。 */
-    overflow-y: hidden;
-  }
-  #pagesRow {
-    display: flex;
-    height: 100%;
   }
   .page-canvas {
-    display: block;
-    flex: 0 0 auto;
+    position: absolute;
+    left: 0;
+    top: 0;
+    display: none;
     background: #ffffff; /* Canvas自体は紙のイメージで常に白 */
-    touch-action: none; /* 指の挙動(1本指=描画/2本指=パン)は全てJS側で判定・処理する */
-    border-right: 2px solid #cfcfcf; /* 画面(ページ)の区切り */
+    touch-action: none;  /* iOSのネイティブスクロール/ズームジェスチャーを無効化し、常に描画に使う */
   }
+  .page-canvas.current { display: block; }
+  #emptyHint {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #666;
+    font-size: 14px;
+    text-align: center;
+    padding: 24px;
+  }
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  .modal-box {
+    background: #1a1c22;
+    border: 1px solid #2a2d38;
+    border-radius: 12px;
+    padding: 20px;
+    width: min(90vw, 360px);
+  }
+  .modal-box p {
+    margin: 0 0 16px;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+  .modal-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .modal-actions button { width: 100%; }
 </style>
 </head>
 <body>
@@ -123,90 +160,82 @@
     <option value="3">RL始点・逆</option>
     <option value="4">RR始点</option>
   </select>
-  <span id="blockCount">0/50</span>
+  <div id="pageNav">
+    <button id="prevBtn">◀</button>
+    <span id="pageIndicator">0/0</span>
+    <button id="nextBtn">▶</button>
+  </div>
   <button id="newBtn" class="danger">新規</button>
   <button id="sendBtn" class="primary">送信</button>
 </div>
 <div id="sendStatus"></div>
 
 <div id="canvasArea">
-  <div id="scrollWrap">
-    <div id="pagesRow"></div>
+  <div id="pagesHost"></div>
+  <div id="emptyHint">BLE接続後、4輪分の測定が完了すると自動で1ページ目が作成されます</div>
+</div>
+
+<input type="file" id="photoInput" accept="image/*" capture="environment" style="display:none">
+
+<div id="confirmModal" class="modal-overlay">
+  <div class="modal-box">
+    <p>まだ送信していない記録があります。新規を作成する前に送信しますか?</p>
+    <div class="modal-actions">
+      <button id="modalSendThenNew" class="primary">送信してから新規</button>
+      <button id="modalNewWithoutSend" class="danger">送信せず新規</button>
+      <button id="modalCancel">キャンセル</button>
+    </div>
   </div>
 </div>
 
 <script>
 // =================================================================
-// TPU-MINI 手書きモード用 Webアプリ(第2版: ページ分割Canvas方式)
+// TPU-MINI 手書きモード用 Webアプリ(第6版: ページ送り方式+タイヤ写真)
 //
 // ★通常モード(tpu_mini_app.html、数値のみGAS送信)とは別ファイルとして分離。
-//   モード切替をアプリ内に持たせるとコードが長くなるため、あえて別アプリにしている。
 //   BLEのUUID・接続処理・測定順テーブルは通常モードと同じものをそのまま流用。
 //
-// ★設計方針の要点(会話で決めた内容):
-//   - 横スクロールの帯に、BLEで4輪確定するたびに「田」の字ブロック(4輪の値+確定時刻)を
-//     自動で右へ追加していく。タブレット1画面幅あたり2ブロック、上半分に田の字の自動記入、
-//     下半分を手書きエリアとする構成。
-//   - 誤測定値の訂正はアプリ側の編集機能では行わず、送信機の表示を見ながら手書きで
-//     直接訂正する運用を前提にしている(訂正専用のUIは用意していない)。
-//   - 送信してもCanvasの内容はクリアされない(タイヤマンがずっと確認できるように)。
-//     送信は担当者が任意のタイミングで押す想定で、その時点の全ページを1枚の画像に
-//     まとめてGASへ送る。
-//   - アプリを開き直しても、明示的に「新規」ボタンを押さない限り前回の続きから使える。
-//     ブラウザのIndexedDBに各ページを画像として保存・復元する。
-//   - 対象端末はiPad(Bluefy等が必要)・Androidタブレット両方、横向き(ランドスケープ)使用。
+// ★これまでの経緯(要約。詳細は過去バージョンのやり取り参照):
+//   初版〜第5版は「横スクロールできる1本の帯にブロックを並べていく」方式だった。
+//   iPad実機での検証で、(1)巨大な1枚Canvasはサイズ上限で描画自体が壊れる
+//   →ページ単位の小さなCanvasに分割して解決、(2)横スクロールと手書きの両方を
+//   指に割り当てると、touch-action任せでも指の本数判定(Pointer Events)でも
+//   WebKit(iOS Safari/Chrome/Bluefyは全てWebKitベース)で安定しなかった、
+//   という2つの問題が続いた。
 //
-// ★第2版での変更点(重要):
-//   初版は「50ブロック分(25画面分)の巨大な1枚のCanvas」を最初に丸ごと確保する設計
-//   だったが、iPad実機(Safari標準/Bluefy/Chrome、いずれもWebKitベース)で検証したところ、
-//   指での描画が効かないだけでなく、区切り線(本来Canvasに描いているはずの罫線)すら
-//   表示されないという不具合が出た。PCでは正常に見えていたことから、iOS Safariの
-//   Canvasサイズ上限(古い実装では概ね4096×4096=1670万px程度が目安とされる)を、
-//   DPR込みの巨大な1枚Canvasが超えてしまい、WebKit側が描画バッファの確保自体に
-//   失敗して「何も描かれない(エラーも出ない)」状態になっていた可能性が高いと判断した。
+// ★第6版での方針転換(現在の方式):
+//   「横スクロールをやめて、ページ送り(◀/▶ボタン)方式にする」という判断により、
+//   指の役割は常に描画専用の1つだけになり、スクロール/マルチタッチ判定のロジックが
+//   丸ごと不要になった。これによりPointer Events主体のシンプルな実装に戻せる。
+//   あわせて「1ページ=1回の4輪測定」という単位に統一(旧「ブロック」概念は廃止し、
+//   ページに統合)。ページ中央に田の字の4輪値、その周囲にFL/RL/RR/FR各タイヤの
+//   位置に対応した写真エリアを4つ配置するレイアウトに変更した。
+//   写真はタブレットのカメラで撮影し、該当エリアの矩形サイズに合わせて
+//   (アスペクト比を保ったまま矩形いっぱいに切り抜く「cover」方式で)Canvasへ
+//   直接描き込む。描き込み先の矩形自体が小さいため、元写真が高解像度でも
+//   結果的に縮小されたサイズで焼き込まれる(=写真ぶんの最終画像サイズは抑えられる)。
+//   同じエリアをタップし直すと新しい写真で上書きされ、そのまま「撮り直し」になる。
 //
-//   対策として、Canvasを「1画面(2ブロック)ごとに1枚」の小さなCanvas要素に分割し、
-//   ブロックが増えるたびに必要な分だけ新しいページ用Canvasを追加で生成する方式に変更した。
-//   1ページ分のCanvasは十分小さい(数百万px程度)ため、上限に達する心配がない。
-//   複数のCanvas要素を横に並べる(displex:flexの行)ことで、見た目上は1本の帯として
-//   スクロールできる。
-//
-// ★第3版での変更点:
-//   第2版では横スクロールをJS側でscrollWrap.scrollLeftを直接操作する方式にしていたが、
-//   iPad実機で「描画はできるようになったが、今度は横スクロールが効かない」という報告が
-//   あった。試しにブラウザのネイティブ実装(touch-action:pan-x)に戻してみたが、それでも
-//   改善しなかった。
-//
-// ★第4版での変更点(現在の方式):
-//   1本指ドラッグの意図(描画かスクロールか)をtouch-actionやブラウザの挙動で判別させる
-//   方式はiPad実機で安定しなかったため、「指の本数」という曖昧さのない基準に切り替えた。
-//   指1本(またはペン/マウス)は常に描画、指2本以上は常にパン(横スクロール)、とJS側だけで
-//   完全に判定する。これに伴い、以前あった「固定」ボタン(1本指の用途をON/OFFで切り替える
-//   ためのもの)は不要になったため削除した。
-//   横スクロールはscrollWrap.scrollLeftをJSで直接操作する(#scrollWrapはoverflow-x:auto。
-//   overflow:hiddenにするとiOS SafariでscrollLeft代入が反映されないことがあるため要注意)。
-//
-// ★第5版での変更点(現在の方式):
-//   第4版(指の本数で描画/パンを判定する方式)は、PC上のChromiumシミュレータでは
-//   正常動作を確認したが、iPad実機(Chrome)で「1本指の描画は正常、2本目の指は
-//   完全に無反応(パンも起きない)」という症状が出た。これはPointer Events APIの
-//   マルチタッチ対応がWebKit(iOS Safari/Chrome/Bluefyは全てWebKitベース)で
-//   不安定であることが既知の制約としてあり、Blink(Chromium)との実装差が原因と
-//   判断した。
-//   そこで、Pointer Eventsでのマルチタッチ判定をやめ、より古くから多点タッチで
-//   安定しているTouch Events API(touchstart/touchmove/touchendとe.touches/
-//   e.changedTouches)に切り替えた。指(touch)の描画・パン判定はTouch Events側で
-//   完結させ、Pointer Eventsはマウス/ペン入力の描画専用として残している
-//   (pointerType==="touch"の場合はPointer Events側では何もしない)。
-//   判定方式自体(1本指=描画、2本目が触れたらパンに切替)は第4版から変更なし。
+//   ページの新規作成は引き続きBLEで4輪の値が揃ったタイミングのみで行い(手動での
+//   ページ追加はない)、作成と同時にそのページへ自動的に表示を切り替える。
+//   送信はこれまで通り「全ページを1枚の画像にまとめて、任意のタイミングで送信」を
+//   維持し、既存のGAS連携(gas_handwriting_addon.gs)は変更していない。ただし
+//   結合方法は横一列の帯ではなく、5列のグリッドに並べる方式に変えた(ページ数が
+//   増えると帯が横に際限なく伸びてCanvasサイズ上限やPC側での確認しやすさの面で
+//   不利なため)。各ページの左上に通し番号(#1, #2…)を薄く重ねて、どのページかが
+//   結合画像だけでも分かるようにしている。
+//   「新規」ボタンを押したとき、まだページが1つでもあれば「送信してから新規」
+//   「送信せず新規」「キャンセル」の3択の確認ダイアログを出す(送信忘れ防止)。
 //
 // ★未確認・要実機再確認の項目:
-//   - 今回の修正(Touch Events方式)でiPad実機の2本指パンが直るかどうか。
-//   - ページ分割によるCanvas描画・区切り線表示・1本指での手書きは前回までの修正で
-//     改善済み(実機で確認取れた)。
-//   - ブロック上限(50)に達した場合の挙動(現状は警告を出して以降の自動追記を止めるだけ)。
-//   - 送信時、多数ページ(理論上最大25ページ)を1枚に結合する際のCanvasサイズ(結合用
-//     Canvasはdpr=1固定で書き出しているが、それでも大きい場合は要調整)。
+//   - ページ送り方式でのタブレット実機(iPad各ブラウザ・Androidタブレット)での
+//     動作(特にページ送りボタンの反応、写真エリアのタップと手書きの誤判定有無)。
+//   - タイヤ写真エリアのレイアウト(サイズ・位置)が実機画面で見やすいか。
+//   - 写真エリア上に手書きで注記したあと、同じエリアを撮り直すと、その手書き部分は
+//     写真に上書きされて消える(写真とインクは同じ1枚のCanvasに焼き込む単純な方式の
+//     ため、レイヤー分離はしていない)。撮り直し前提の運用であれば問題ない想定。
+//   - ブロック(ページ)上限(50)に達した場合の挙動(警告を出して以降の自動追加を止める)。
+//   - 結合画像(5列グリッド)のサイズ・見やすさ。
 // =================================================================
 
 const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
@@ -226,12 +255,15 @@ const WHEEL_ORDER_TABLE = [
   ["RR", "RL", "FL", "FR"],
 ];
 
-const MAX_BLOCKS = 50;          // ★1セッション最大20〜30回の想定に余裕を持たせた上限
-const BLOCKS_PER_PAGE = 2;      // ★タブレット1画面幅あたり2ブロック
+const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
+const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
 
-const DB_NAME = "tpu_mini_handwriting_db";
+// ★DB名は第5版までの「1画面2ブロック」形式と構造が異なるため、混在を避けて新しい名前にしている。
+const DB_NAME = "tpu_mini_handwriting_db_v2";
 const STORE_NAME = "state";
 const STATE_KEY = "current";
+
+const TAP_MOVE_THRESHOLD = 8; // px(CSS座標)。この範囲内の動きは「タップ」とみなす
 
 const el = (id) => document.getElementById(id);
 const textDecoder = new TextDecoder("utf-8");
@@ -242,26 +274,21 @@ let lastKnownModeChar = "A";
 
 let wheelValues = {};
 let currentOrderIdx = 0;
-let blockIndex = 0;
 
-let scrollWrap, pagesRow;
+let pagesHost;
 let dpr = Math.min(window.devicePixelRatio || 1, 2); // ★DPRを最大2までに制限(Canvasサイズ上限対策)
-let PAGE_W_CSS = 0, PAGE_H_CSS = 0, BLOCK_W_CSS = 0, GRID_H = 0;
+let PAGE_W_CSS = 0, PAGE_H_CSS = 0;
+let GRID_RECT = null;
+let PHOTO_RECTS = null; // { FL:{x,y,w,h}, FR:..., RL:..., RR:... }
 
-let pages = []; // pages[pageIdx] = { canvas, ctx } ※実際に使われた分だけ生成する
+let pages = [];         // pages[i] = { canvas, ctx }
+let currentPageIdx = -1;
 
-// ★ペン/マウス用(Pointer Events)。指(touch)はここでは扱わない(下のTouch Events側で処理)。
-let mode = null; // "draw" | null
-let lastX = 0, lastY = 0;             // 描画時: 対象Canvas内座標(CSS px)
-let activeCanvas = null, activeCtx = null; // 現在描画中のページCanvas
-
-// ★指(touch)用(Touch Events)。1本指=描画、2本目が触れたらパンに切替。
-let touchMode = null;      // "draw" | "pan" | null
-let drawTouchId = null;    // 描画中の指のidentifier
-let touchLastX = 0, touchLastY = 0;   // 描画時: 対象Canvas内座標(CSS px)
-let touchActiveCanvas = null, touchActiveCtx = null;
-let panTouchId = null;     // パン中、どの指の動きを基準にするか(identifier)
-let panLastClientX = 0;    // パン時: 画面(viewport)基準のX座標
+// --- 描画/写真タップ判定用(Pointer Eventsのみ。マウス/ペン/指すべて共通) ---
+let mode = null;               // "draw" | null
+let activeCanvas = null, activeCtx = null, activePage = null;
+let downX = 0, downY = 0, lastX = 0, lastY = 0, moved = false;
+let pendingPhotoTarget = null; // { page, wheel }
 
 function currentWheelOrder() {
   return WHEEL_ORDER_TABLE[parseInt(el("wheelOrder").value, 10)];
@@ -273,19 +300,27 @@ function resetWheelCollector() {
   currentWheelOrder().forEach(w => wheelValues[w] = null);
 }
 
-function pageIndexOf(idx) { return Math.floor(idx / BLOCKS_PER_PAGE); }
-function slotIndexOf(idx) { return idx % BLOCKS_PER_PAGE; }
-
 // -----------------------------------------------------------------
-// レイアウトの初期化(1画面=1ページの寸法を決める。以後変更しない)
+// レイアウトの初期化(1ページ分の寸法・各エリアの矩形を決める。以後変更しない)
 // -----------------------------------------------------------------
 function setupLayout() {
-  scrollWrap = el("scrollWrap");
-  pagesRow = el("pagesRow");
+  pagesHost = el("pagesHost");
   PAGE_W_CSS = Math.max(600, Math.round(window.innerWidth));
-  BLOCK_W_CSS = PAGE_W_CSS / BLOCKS_PER_PAGE;
   PAGE_H_CSS = Math.max(300, el("canvasArea").clientHeight);
-  GRID_H = PAGE_H_CSS * 0.5;
+
+  const gw = PAGE_W_CSS * 0.34;
+  const gh = PAGE_H_CSS * 0.62;
+  GRID_RECT = { x: (PAGE_W_CSS - gw) / 2, y: (PAGE_H_CSS - gh) / 2, w: gw, h: gh };
+
+  const pw = (PAGE_W_CSS - gw) / 2;
+  const ph = PAGE_H_CSS / 2;
+  const pad = 14;
+  PHOTO_RECTS = {
+    FL: { x: pad,                  y: pad,      w: pw - pad * 2, h: ph - pad * 2 },
+    FR: { x: PAGE_W_CSS - pw + pad, y: pad,      w: pw - pad * 2, h: ph - pad * 2 },
+    RL: { x: pad,                  y: ph + pad, w: pw - pad * 2, h: ph - pad * 2 },
+    RR: { x: PAGE_W_CSS - pw + pad, y: ph + pad, w: pw - pad * 2, h: ph - pad * 2 },
+  };
 }
 
 function paintPageBackground(canvasEl, ctx) {
@@ -296,62 +331,107 @@ function paintPageBackground(canvasEl, ctx) {
   ctx.restore();
 }
 
-function drawPageGuides(ctx) {
+function drawGridBox(ctx, values, timestampStr) {
+  const r = GRID_RECT;
   ctx.save();
-  // 2ブロックの境界(細線)
-  ctx.strokeStyle = "#e5e5e5";
-  ctx.lineWidth = 1;
-  ctx.beginPath();
-  ctx.moveTo(BLOCK_W_CSS, 0);
-  ctx.lineTo(BLOCK_W_CSS, PAGE_H_CSS);
-  ctx.stroke();
-  // 自動記入ゾーン(上半分)と手書きゾーン(下半分)の区切り
-  ctx.strokeStyle = "#cfcfcf";
+  ctx.strokeStyle = "#333";
   ctx.lineWidth = 1.5;
-  ctx.setLineDash([6, 4]);
+  ctx.strokeRect(r.x, r.y, r.w, r.h);
   ctx.beginPath();
-  ctx.moveTo(0, GRID_H);
-  ctx.lineTo(PAGE_W_CSS, GRID_H);
+  ctx.moveTo(r.x + r.w / 2, r.y);
+  ctx.lineTo(r.x + r.w / 2, r.y + r.h);
+  ctx.moveTo(r.x, r.y + r.h / 2);
+  ctx.lineTo(r.x + r.w, r.y + r.h / 2);
   ctx.stroke();
-  ctx.setLineDash([]);
+
+  const cellW = r.w / 2, cellH = r.h / 2;
+  const cells = [
+    { label: "FL", cx: r.x + cellW * 0.5, cy: r.y + cellH * 0.5, val: values.FL },
+    { label: "FR", cx: r.x + cellW * 1.5, cy: r.y + cellH * 0.5, val: values.FR },
+    { label: "RL", cx: r.x + cellW * 0.5, cy: r.y + cellH * 1.5, val: values.RL },
+    { label: "RR", cx: r.x + cellW * 1.5, cy: r.y + cellH * 1.5, val: values.RR },
+  ];
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  cells.forEach(c => {
+    ctx.fillStyle = "#999999";
+    ctx.font = "12px sans-serif";
+    ctx.fillText(c.label, c.cx, c.cy - 15);
+    ctx.fillStyle = "#111111";
+    ctx.font = "bold 20px sans-serif";
+    ctx.fillText(c.val != null ? c.val.toFixed(1) : "--.-", c.cx, c.cy + 6);
+  });
+
+  ctx.fillStyle = "#666666";
+  ctx.font = "11px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(timestampStr, r.x + r.w / 2, r.y + r.h + 16);
   ctx.restore();
 }
 
-function attachPointerHandlers(canvasEl) {
-  // マウス/ペン(Pointer Events)。指(touch)はここでは無視し、Touch Events側で処理する。
-  canvasEl.addEventListener("pointerdown", (e) => onPointerDown(e, canvasEl));
-  canvasEl.addEventListener("pointermove", onPointerMove);
-  canvasEl.addEventListener("pointerup", onPointerEnd);
-  canvasEl.addEventListener("pointercancel", onPointerEnd);
-  canvasEl.addEventListener("pointerleave", onPointerEnd);
-  // 指(touch, Touch Events)。WebKitでのPointer Eventsマルチタッチ不安定問題を避けるため。
-  canvasEl.addEventListener("touchstart", (e) => onTouchStart(e, canvasEl), { passive: false });
-  canvasEl.addEventListener("touchmove", (e) => onTouchMove(e, canvasEl), { passive: false });
-  canvasEl.addEventListener("touchend", (e) => onTouchEnd(e, canvasEl), { passive: false });
-  canvasEl.addEventListener("touchcancel", (e) => onTouchCancel(e, canvasEl), { passive: false });
+function drawPhotoPlaceholder(ctx, label, rect) {
+  ctx.save();
+  ctx.strokeStyle = "#bbbbbb";
+  ctx.setLineDash([6, 4]);
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+  ctx.setLineDash([]);
+  ctx.fillStyle = "#999999";
+  ctx.font = "12px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label + " タップして撮影", rect.x + rect.w / 2, rect.y + rect.h / 2);
+  ctx.restore();
 }
 
-function createPageCanvas(pageIdx) {
+function makeCanvasEl() {
   const c = document.createElement("canvas");
   c.className = "page-canvas";
   c.style.width = PAGE_W_CSS + "px";
   c.style.height = PAGE_H_CSS + "px";
   c.width = Math.round(PAGE_W_CSS * dpr);
   c.height = Math.round(PAGE_H_CSS * dpr);
-  // touch-actionはCSS(.page-canvas)で常にnone。指の挙動は全てJS側(onPointerDown等)で判定する。
   const ctx = c.getContext("2d");
   ctx.scale(dpr, dpr);
-  pagesRow.appendChild(c);
-  paintPageBackground(c, ctx);
-  drawPageGuides(ctx);
-  attachPointerHandlers(c);
-  pages[pageIdx] = { canvas: c, ctx };
-  return pages[pageIdx];
+  pagesHost.appendChild(c);
+  return { canvas: c, ctx };
 }
 
-function getOrCreatePage(pageIdx) {
-  if (!pages[pageIdx]) createPageCanvas(pageIdx);
-  return pages[pageIdx];
+// まだ測定値が無い空のページを1枚作る(アプリ起動直後や「新規」直後に用意しておく)。
+// BLE接続前でも手書き/写真だけ先に試せるようにするための土台で、値は「--.-」表示のまま。
+// これ自体は測定1回分としてカウントしない(BLEで4輪揃うと別途createMeasuredPageで
+// 新しいページが追加される。このページは車番・注記などの自由記入用としても使える)。
+function createEmptyPage() {
+  const { canvas, ctx } = makeCanvasEl();
+  paintPageBackground(canvas, ctx);
+  drawGridBox(ctx, { FL: null, FR: null, RL: null, RR: null }, "");
+  ["FL", "FR", "RL", "RR"].forEach(w => drawPhotoPlaceholder(ctx, w, PHOTO_RECTS[w]));
+  const page = { canvas, ctx };
+  attachInputHandlers(canvas, page);
+  pages.push(page);
+  return page;
+}
+
+// BLE確定の4輪値から新しいページを1枚作る(=1回の測定)
+function createMeasuredPage(values, timestampStr) {
+  const { canvas, ctx } = makeCanvasEl();
+  paintPageBackground(canvas, ctx);
+  drawGridBox(ctx, values, timestampStr);
+  ["FL", "FR", "RL", "RR"].forEach(w => drawPhotoPlaceholder(ctx, w, PHOTO_RECTS[w]));
+  const page = { canvas, ctx };
+  attachInputHandlers(canvas, page);
+  pages.push(page);
+  return page;
+}
+
+// 復元用: 中身はcreateImageBitmapで丸ごと上書きするので、ここでは器だけ作る
+function createBlankPageForRestore() {
+  const { canvas, ctx } = makeCanvasEl();
+  const page = { canvas, ctx };
+  attachInputHandlers(canvas, page);
+  pages.push(page);
+  return page;
 }
 
 function formatTimestamp(d) {
@@ -359,60 +439,32 @@ function formatTimestamp(d) {
   return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
 }
 
-// 「田」の字ブロックを1つ描く(4輪の値+確定時刻)。blockIdxからページと枠位置を割り出す。
-function drawBlockAt(blockIdx, values, timestampStr) {
-  const pageIdx = pageIndexOf(blockIdx);
-  const slot = slotIndexOf(blockIdx);
-  const page = getOrCreatePage(pageIdx);
-  const ctx = page.ctx;
-
-  const pad = 10;
-  const x0 = slot * BLOCK_W_CSS;
-  const gx = x0 + pad;
-  const gy = pad;
-  const gw = BLOCK_W_CSS - pad * 2;
-  const gh = GRID_H - pad * 2 - 16; // 下に時刻を書くぶんを残す
-
-  ctx.save();
-  ctx.strokeStyle = "#333";
-  ctx.lineWidth = 1.5;
-  ctx.strokeRect(gx, gy, gw, gh);
-  ctx.beginPath();
-  ctx.moveTo(gx + gw / 2, gy);
-  ctx.lineTo(gx + gw / 2, gy + gh);
-  ctx.moveTo(gx, gy + gh / 2);
-  ctx.lineTo(gx + gw, gy + gh / 2);
-  ctx.stroke();
-
-  const cellW = gw / 2, cellH = gh / 2;
-  const cells = [
-    { label: "FL", cx: gx + cellW * 0.5, cy: gy + cellH * 0.5, val: values.FL },
-    { label: "FR", cx: gx + cellW * 1.5, cy: gy + cellH * 0.5, val: values.FR },
-    { label: "RL", cx: gx + cellW * 0.5, cy: gy + cellH * 1.5, val: values.RL },
-    { label: "RR", cx: gx + cellW * 1.5, cy: gy + cellH * 1.5, val: values.RR },
-  ];
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  cells.forEach(c => {
-    ctx.fillStyle = "#999999";
-    ctx.font = "11px sans-serif";
-    ctx.fillText(c.label, c.cx, c.cy - 13);
-    ctx.fillStyle = "#111111";
-    ctx.font = "bold 17px sans-serif";
-    ctx.fillText(c.val != null ? c.val.toFixed(1) : "--.-", c.cx, c.cy + 5);
-  });
-
-  ctx.fillStyle = "#666666";
-  ctx.font = "10px sans-serif";
-  ctx.textAlign = "left";
-  ctx.textBaseline = "alphabetic";
-  ctx.fillText(timestampStr, gx, gy + gh + 14);
-  ctx.restore();
+// -----------------------------------------------------------------
+// ページ送りナビゲーション
+// -----------------------------------------------------------------
+function showPage(idx) {
+  if (idx < 0 || idx >= pages.length) return;
+  if (currentPageIdx >= 0 && pages[currentPageIdx]) {
+    pages[currentPageIdx].canvas.classList.remove("current");
+  }
+  currentPageIdx = idx;
+  pages[currentPageIdx].canvas.classList.add("current");
+  updatePageIndicator();
+  updateNavButtons();
 }
 
-function updateBlockCountLabel() {
-  el("blockCount").textContent = `${blockIndex}/${MAX_BLOCKS}`;
+function updatePageIndicator() {
+  el("pageIndicator").textContent = pages.length ? `${currentPageIdx + 1}/${pages.length}` : "0/0";
+  el("emptyHint").style.display = pages.length ? "none" : "flex";
 }
+
+function updateNavButtons() {
+  el("prevBtn").disabled = currentPageIdx <= 0;
+  el("nextBtn").disabled = currentPageIdx >= pages.length - 1;
+}
+
+function goPrev() { showPage(currentPageIdx - 1); }
+function goNext() { showPage(currentPageIdx + 1); }
 
 function onConfirmedValue(kpa) {
   const order = currentWheelOrder();
@@ -421,42 +473,26 @@ function onConfirmedValue(kpa) {
   wheelValues[wheel] = kpa;
   currentOrderIdx++;
   if (currentOrderIdx >= order.length) {
-    if (blockIndex >= MAX_BLOCKS) {
-      alert("本日の上限(" + MAX_BLOCKS + "ブロック)に達しました。「新規」で次のシートを開始してください。");
+    if (pages.length >= MAX_PAGES) {
+      alert(`本日の上限(${MAX_PAGES}ページ)に達しました。「新規」で次のシートを開始してください。`);
       resetWheelCollector();
       return;
     }
-    const wasNearEnd = isScrollNearEnd();
-    drawBlockAt(blockIndex, wheelValues, formatTimestamp(new Date()));
-    blockIndex++;
-    updateBlockCountLabel();
+    createMeasuredPage({ ...wheelValues }, formatTimestamp(new Date()));
+    showPage(pages.length - 1); // 新規ページへ自動で表示切り替え
+    hasContent = true;
     resetWheelCollector();
     saveState();
-    if (wasNearEnd) scrollToLatest();
   }
 }
 
-function isScrollNearEnd() {
-  const maxScroll = scrollWrap.scrollWidth - scrollWrap.clientWidth;
-  return (maxScroll - scrollWrap.scrollLeft) < PAGE_W_CSS * 0.75;
-}
-
-function scrollToLatest() {
-  const pageIdx = pageIndexOf(Math.max(0, blockIndex - 1));
-  const page = pages[pageIdx];
-  if (!page) return;
-  scrollWrap.scrollTo({ left: Math.max(0, page.canvas.offsetLeft), behavior: "smooth" });
-}
-
 // -----------------------------------------------------------------
-// 手書き入力。
-//   - ペン/マウス: Pointer Eventsで常に描画。
-//   - 指(touch): Touch Eventsで判定する(WebKitはPointer Eventsのマルチタッチ対応が
-//     不安定なため、指の扱いはTouch Events APIに分離した。第5版のコメント参照)。
-//       1本: 描画。2本以上: パン(横スクロール)。2本目が触れた時点で、1本目による
-//       描画中だった場合はそこで打ち切ってパンへ切り替える。
-//   横スクロールはscrollWrap.scrollLeftを直接操作する(#scrollWrapがoverflow:autoなので
-//   反映される。overflow:hiddenだと反映されないことがあるため注意)。
+// 手書き入力 + タイヤ写真エリアのタップ判定(Pointer Eventsのみ)
+//   ページ送り方式にしたことで横スクロールが無くなり、指の役割は常に描画専用の
+//   1つだけになった。そのため、以前(第4版・第5版)にあった「指の本数でパンと
+//   描画を切り替える」ロジック(Touch Events併用)は不要になったため撤去した。
+//   写真エリア内での「タップ(ほぼ動かさない)」はカメラ起動、それ以外の動き
+//   (ドラッグ)は通常の手書きとして扱う。判定は移動量(TAP_MOVE_THRESHOLD)で行う。
 // -----------------------------------------------------------------
 function getPos(clientX, clientY, canvasEl) {
   const rect = canvasEl.getBoundingClientRect();
@@ -476,112 +512,121 @@ function strokeLine(ctx, x0, y0, x1, y1) {
   ctx.restore();
 }
 
-function touchListFind(list, id) {
-  for (let i = 0; i < list.length; i++) {
-    if (list[i].identifier === id) return list[i];
+function hitTestPhoto(x, y) {
+  for (const w of ["FL", "FR", "RL", "RR"]) {
+    const r = PHOTO_RECTS[w];
+    if (x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h) return w;
   }
   return null;
 }
 
-// --- ペン/マウス(Pointer Events)。指(touch)はここでは扱わない ---
-function onPointerDown(e, canvasEl) {
-  if (e.pointerType === "touch") return; // 指はTouch Events側で処理
+function attachInputHandlers(canvasEl, page) {
+  canvasEl.addEventListener("pointerdown", (e) => onPointerDown(e, canvasEl, page));
+  canvasEl.addEventListener("pointermove", onPointerMove);
+  canvasEl.addEventListener("pointerup", onPointerEnd);
+  canvasEl.addEventListener("pointercancel", onPointerEnd);
+  canvasEl.addEventListener("pointerleave", onPointerEnd);
+}
+
+function onPointerDown(e, canvasEl, page) {
   e.preventDefault();
   canvasEl.setPointerCapture(e.pointerId);
   mode = "draw";
   activeCanvas = canvasEl;
   activeCtx = canvasEl.getContext("2d");
+  activePage = page;
   const p = getPos(e.clientX, e.clientY, canvasEl);
-  lastX = p.x; lastY = p.y;
+  downX = p.x; downY = p.y; lastX = p.x; lastY = p.y; moved = false;
 }
 
 function onPointerMove(e) {
-  if (e.pointerType === "touch") return;
-  if (mode === "draw" && activeCtx) {
-    e.preventDefault();
-    const p = getPos(e.clientX, e.clientY, activeCanvas);
+  if (mode !== "draw" || !activeCtx) return;
+  e.preventDefault();
+  const p = getPos(e.clientX, e.clientY, activeCanvas);
+  if (!moved) {
+    if (Math.hypot(p.x - downX, p.y - downY) > TAP_MOVE_THRESHOLD) {
+      moved = true;
+      strokeLine(activeCtx, downX, downY, p.x, p.y); // 閾値を超えた瞬間、最初の区間も描く
+    }
+  } else {
     strokeLine(activeCtx, lastX, lastY, p.x, p.y);
-    lastX = p.x; lastY = p.y;
   }
+  lastX = p.x; lastY = p.y;
 }
 
 function onPointerEnd(e) {
-  if (e.pointerType === "touch") return;
-  if (mode === "draw") {
+  if (mode !== "draw") return;
+  if (!moved) {
+    const wheel = hitTestPhoto(downX, downY);
+    if (wheel) openCameraFor(activePage, wheel);
+  } else {
+    hasContent = true;
     saveState();
-    mode = null;
-    activeCanvas = null;
-    activeCtx = null;
   }
+  mode = null;
+  activeCanvas = null; activeCtx = null; activePage = null;
 }
 
-// --- 指(Touch Events)。1本=描画、2本以上=パン ---
-function onTouchStart(e, canvasEl) {
-  e.preventDefault();
-  const touches = e.targetTouches; // このcanvasEl上で現在触れている指のみ
-
-  if (touches.length >= 2) {
-    // 2本目の指が触れた → パンに切り替える(描画中だった場合はそこで打ち切り)
-    touchMode = "pan";
-    const t = touches[touches.length - 1];
-    panTouchId = t.identifier;
-    panLastClientX = t.clientX;
-    touchActiveCanvas = null;
-    touchActiveCtx = null;
-    return;
-  }
-
-  touchMode = "draw";
-  const t = touches[0];
-  drawTouchId = t.identifier;
-  touchActiveCanvas = canvasEl;
-  touchActiveCtx = canvasEl.getContext("2d");
-  const p = getPos(t.clientX, t.clientY, canvasEl);
-  touchLastX = p.x; touchLastY = p.y;
+// -----------------------------------------------------------------
+// タイヤ写真の撮影・合成
+// -----------------------------------------------------------------
+function openCameraFor(page, wheel) {
+  pendingPhotoTarget = { page, wheel };
+  el("photoInput").value = ""; // 同じファイルを連続選択してもchangeが発火するようにリセット
+  el("photoInput").click();
 }
 
-function onTouchMove(e, canvasEl) {
-  e.preventDefault();
-  if (touchMode === "pan") {
-    const t = touchListFind(e.targetTouches, panTouchId);
-    if (!t) return;
-    const delta = t.clientX - panLastClientX;
-    scrollWrap.scrollLeft -= delta;
-    panLastClientX = t.clientX;
-    return;
-  }
-  if (touchMode === "draw" && touchActiveCtx) {
-    const t = touchListFind(e.targetTouches, drawTouchId);
-    if (!t) return;
-    const p = getPos(t.clientX, t.clientY, touchActiveCanvas);
-    strokeLine(touchActiveCtx, touchLastX, touchLastY, p.x, p.y);
-    touchLastX = p.x; touchLastY = p.y;
-  }
+function loadImageFromFile(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("画像の読み込みに失敗しました")); };
+    img.src = url;
+  });
 }
 
-function resetTouchGesture() {
-  touchMode = null;
-  drawTouchId = null;
-  panTouchId = null;
-  touchActiveCanvas = null;
-  touchActiveCtx = null;
+// 矩形いっぱいに「cover」方式(アスペクト比維持のまま中央を切り抜き)で描き込む。
+// 描画先の矩形自体が小さいため、元写真が高解像度でもここで実質的に縮小される。
+async function drawPhotoIntoPage(page, wheel, file) {
+  const img = await loadImageFromFile(file);
+  const rect = PHOTO_RECTS[wheel];
+  const ctx = page.ctx;
+  const scale = Math.max(rect.w / img.width, rect.h / img.height);
+  const sw = rect.w / scale, sh = rect.h / scale;
+  const sx = (img.width - sw) / 2, sy = (img.height - sh) / 2;
+
+  ctx.save();
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(img, sx, sy, sw, sh, rect.x, rect.y, rect.w, rect.h); // 矩形を隙間なく埋めるので、古いプレースホルダーは完全に上書きされる
+  ctx.strokeStyle = "#333333";
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+  ctx.fillStyle = "#ffffff";
+  ctx.font = "bold 11px sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.shadowColor = "rgba(0,0,0,0.7)";
+  ctx.shadowBlur = 3;
+  ctx.fillText(wheel, rect.x + 4, rect.y + 4);
+  ctx.restore();
 }
 
-function onTouchEnd(e, canvasEl) {
-  if (touchMode === "pan" && touchListFind(e.changedTouches, panTouchId)) {
-    resetTouchGesture();
-    return;
-  }
-  if (touchMode === "draw" && touchListFind(e.changedTouches, drawTouchId)) {
+el("photoInput").addEventListener("change", async (e) => {
+  const file = e.target.files && e.target.files[0];
+  const target = pendingPhotoTarget;
+  pendingPhotoTarget = null;
+  if (!file || !target) return;
+  try {
+    await drawPhotoIntoPage(target.page, target.wheel, file);
+    hasContent = true;
     saveState();
-    resetTouchGesture();
+  } catch (err) {
+    console.error("[TPU-MINI handwriting] photo draw failed:", err);
+    alert("写真の読み込みに失敗しました: " + err.message);
   }
-}
-
-function onTouchCancel(e, canvasEl) {
-  // 割り込み(電話着信など)発生時は状態をリセットするだけにする(念のためsaveStateはしない)
-  resetTouchGesture();
-}
+});
 
 // -----------------------------------------------------------------
 // IndexedDBへの保存・復元(各ページをPNGビットマップとして保存する簡易方式)
@@ -605,7 +650,7 @@ async function saveState() {
     const db = await openDb();
     await new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, "readwrite");
-      tx.objectStore(STORE_NAME).put({ blockIndex, pageBlobs, savedAt: Date.now() }, STATE_KEY);
+      tx.objectStore(STORE_NAME).put({ pageBlobs, currentPageIdx, hasContent, savedAt: Date.now() }, STATE_KEY);
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
     });
@@ -625,28 +670,36 @@ async function loadState() {
     });
     if (rec && rec.pageBlobs && rec.pageBlobs.length > 0) {
       for (let i = 0; i < rec.pageBlobs.length; i++) {
-        const { ctx } = createPageCanvas(i);
+        const page = createBlankPageForRestore();
         const bitmap = await createImageBitmap(rec.pageBlobs[i]);
-        ctx.save();
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-        ctx.drawImage(bitmap, 0, 0);
-        ctx.restore();
+        page.ctx.save();
+        page.ctx.setTransform(1, 0, 0, 1, 0, 0);
+        page.ctx.drawImage(bitmap, 0, 0);
+        page.ctx.restore();
       }
-      blockIndex = rec.blockIndex || 0;
-      updateBlockCountLabel();
+      const restoreIdx = Math.min(Math.max(0, rec.currentPageIdx ?? 0), pages.length - 1);
+      showPage(restoreIdx);
+      hasContent = rec.hasContent !== undefined ? rec.hasContent : pages.length > 1;
       return;
     }
   } catch (err) {
     console.error("[TPU-MINI handwriting] loadState failed:", err);
   }
-  // 保存データが無ければ1ページ目だけ用意しておく
-  createPageCanvas(0);
-  blockIndex = 0;
-  updateBlockCountLabel();
+  // 保存データが無ければ、測定前でも試せるよう空のページを1枚用意しておく
+  createEmptyPage();
+  showPage(0);
 }
 
-async function startNew() {
-  if (!confirm("現在の記録をクリアして新しいシートを開始します。よろしいですか?")) return;
+// 「新規」時に送信忘れ確認ダイアログを出すかどうかの判定用。
+// 起動直後に用意される空ページ(createEmptyPage)だけの状態では警告を出したくないため、
+// 単純なpages.length>0ではなく、実際に何か記入された(測定・手書き・写真)かどうかを見る。
+let hasContent = false;
+
+function hasUnsentContent() {
+  return hasContent;
+}
+
+async function clearAllAndStartFresh() {
   try {
     const db = await openDb();
     await new Promise((resolve, reject) => {
@@ -656,19 +709,31 @@ async function startNew() {
       tx.onerror = () => reject(tx.error);
     });
   } catch (err) {
-    console.error("[TPU-MINI handwriting] startNew delete failed:", err);
+    console.error("[TPU-MINI handwriting] clearAllAndStartFresh delete failed:", err);
   }
-  pagesRow.innerHTML = "";
+  pagesHost.innerHTML = "";
   pages = [];
-  createPageCanvas(0);
-  blockIndex = 0;
-  updateBlockCountLabel();
+  currentPageIdx = -1;
+  hasContent = false;
+  createEmptyPage();
+  showPage(0);
   resetWheelCollector();
-  scrollWrap.scrollLeft = 0;
+  el("sendStatus").textContent = "";
+}
+
+function showConfirmModal() { el("confirmModal").style.display = "flex"; }
+function hideConfirmModal() { el("confirmModal").style.display = "none"; }
+
+async function onNewBtnClick() {
+  if (!hasUnsentContent()) {
+    await clearAllAndStartFresh();
+    return;
+  }
+  showConfirmModal();
 }
 
 // -----------------------------------------------------------------
-// GASへの送信(画像のみ。全ページを1枚に結合してbase64でPOST)
+// GASへの送信(画像のみ。全ページを5列グリッドの1枚に結合してbase64でPOST)
 // -----------------------------------------------------------------
 function blobToBase64(blob) {
   return new Promise((resolve, reject) => {
@@ -682,34 +747,45 @@ function blobToBase64(blob) {
   });
 }
 
-// 全ページのCanvasを横に並べた1枚の画像に結合する。
-// ★結合用Canvasはdpr=1固定で書き出す(ページ数が多い場合でもCanvasサイズ上限に
-//   近づきにくくするため。PCで内容確認する用途なので解像度はこれで十分)。
+// ★横一列の帯だとページ数が増えるほど際限なく横長になる(Canvasサイズ上限や
+//   PC側での確認しやすさの面で不利)ため、5列のグリッドに並べて結合する。
 async function buildCombinedBlob() {
   const n = pages.length;
-  const exportDpr = 1;
+  const cols = Math.min(COMBINED_COLS, n) || 1;
+  const rows = Math.ceil(n / cols);
+  const exportDpr = 1; // 結合用Canvasはdpr=1固定で書き出す(PC確認用途なので解像度はこれで十分)
+  const cw = Math.round(PAGE_W_CSS * exportDpr);
+  const ch = Math.round(PAGE_H_CSS * exportDpr);
+
   const tmp = document.createElement("canvas");
-  tmp.width = Math.round(PAGE_W_CSS * n * exportDpr);
-  tmp.height = Math.round(PAGE_H_CSS * exportDpr);
+  tmp.width = cw * cols;
+  tmp.height = ch * rows;
   const tctx = tmp.getContext("2d");
   tctx.fillStyle = "#ffffff";
   tctx.fillRect(0, 0, tmp.width, tmp.height);
+
   for (let i = 0; i < n; i++) {
+    const col = i % cols, row = Math.floor(i / cols);
     const src = pages[i].canvas;
-    tctx.drawImage(
-      src, 0, 0, src.width, src.height,
-      Math.round(i * PAGE_W_CSS * exportDpr), 0,
-      Math.round(PAGE_W_CSS * exportDpr), Math.round(PAGE_H_CSS * exportDpr)
-    );
+    const dx = col * cw, dy = row * ch;
+    tctx.drawImage(src, 0, 0, src.width, src.height, dx, dy, cw, ch);
+    tctx.save();
+    tctx.fillStyle = "rgba(0,0,0,0.55)";
+    tctx.font = "bold 14px sans-serif";
+    tctx.textAlign = "left";
+    tctx.textBaseline = "top";
+    tctx.fillText(`#${i + 1}`, dx + 6, dy + 6);
+    tctx.restore();
   }
   return new Promise(res => tmp.toBlob(res, "image/png"));
 }
 
+// 成功したかどうかをbooleanで返す(「送信してから新規」の判断に使うため)
 async function sendToGas() {
   const statusEl = el("sendStatus");
   if (pages.length === 0) {
     statusEl.textContent = "まだ記録がありません。";
-    return;
+    return false;
   }
   statusEl.textContent = "画像を書き出し中...";
   try {
@@ -728,9 +804,11 @@ async function sendToGas() {
     });
     statusEl.textContent = `送信完了 (HTTP ${res.status}) ${new Date().toLocaleTimeString("ja-JP")}`;
     console.log("[TPU-MINI handwriting] sent to GAS, status:", res.status);
+    return res.ok;
   } catch (err) {
     statusEl.textContent = "送信失敗: " + err.message;
     console.error("[TPU-MINI handwriting] GAS send failed:", err);
+    return false;
   }
 }
 
@@ -815,12 +893,18 @@ async function init() {
   setupLayout();
   await loadState();
 
-  // ★PC(マウス+トラックパッド/ホイール)での動作確認用。指のネイティブスクロールを
-  //   使わない設計にしたため、実機(タブレット)以外ではスクロール手段が無くなって
-  //   しまうところを、ホイール操作でも横スクロールできるようにしておく。
-  scrollWrap.addEventListener("wheel", (e) => {
+  // ★PCではホイール操作でもページ送りできるようにしておく(タブレット実機は
+  //   ◀/▶ボタンでの操作が基本)。連続発火しすぎないよう簡易クールダウンを入れる。
+  let wheelCooldown = false;
+  el("canvasArea").addEventListener("wheel", (e) => {
     e.preventDefault();
-    scrollWrap.scrollLeft += (e.deltaX !== 0 ? e.deltaX : e.deltaY);
+    if (wheelCooldown) return;
+    const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    if (delta > 10) goNext();
+    else if (delta < -10) goPrev();
+    else return;
+    wheelCooldown = true;
+    setTimeout(() => { wheelCooldown = false; }, 350);
   }, { passive: false });
 
   el("connectBtn").addEventListener("click", () => {
@@ -828,8 +912,25 @@ async function init() {
     else connect();
   });
   el("wheelOrder").addEventListener("change", resetWheelCollector);
-  el("newBtn").addEventListener("click", startNew);
+  el("prevBtn").addEventListener("click", goPrev);
+  el("nextBtn").addEventListener("click", goNext);
+  el("newBtn").addEventListener("click", onNewBtnClick);
   el("sendBtn").addEventListener("click", sendToGas);
+
+  el("modalCancel").addEventListener("click", hideConfirmModal);
+  el("modalNewWithoutSend").addEventListener("click", async () => {
+    hideConfirmModal();
+    await clearAllAndStartFresh();
+  });
+  el("modalSendThenNew").addEventListener("click", async () => {
+    hideConfirmModal();
+    const ok = await sendToGas();
+    if (ok) {
+      await clearAllAndStartFresh();
+    } else {
+      alert("送信に失敗したため、新規は中止しました。もう一度お試しください。");
+    }
+  });
 
   resetWheelCollector();
 }
