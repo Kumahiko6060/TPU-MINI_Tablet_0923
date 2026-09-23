@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>TPU-MINI 手書きモード</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden; /* ページ自体はスクロールさせない。スクロールするのはCanvasの横方向のみ */
+    font-family: -apple-system, BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+    background: #111318;
+    color: #eee;
+  }
+  #header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 10px;
+    background: #1a1c22;
+    border-bottom: 1px solid #2a2d38;
+  }
+  #header h1 {
+    font-size: 14px;
+    margin: 0 10px 0 0;
+    white-space: nowrap;
+  }
+  button {
+    font-size: 13px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    background: #23262f;
+    color: #eee;
+  }
+  button.primary { background: #2f6fed; border-color: #2f6fed; }
+  button.danger { background: #4a2323; border-color: #7a3a3a; }
+  button:disabled { opacity: 0.4; }
+  select {
+    font-size: 13px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    background: #1a1c22;
+    color: #eee;
+  }
+  .status {
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .status.connected { background: #163d24; color: #4ade80; }
+  .status.disconnected { background: #3d1a1a; color: #f87171; }
+  #liveInfo {
+    font-size: 12px;
+    color: #aaa;
+    white-space: nowrap;
+  }
+  #blockCount {
+    font-size: 12px;
+    color: #aaa;
+    white-space: nowrap;
+    margin-left: auto;
+  }
+  #sendStatus {
+    font-size: 11px;
+    color: #888;
+    padding: 4px 10px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #scrollWrap {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
+  }
+  #sheetCanvas {
+    display: block;
+    background: #ffffff; /* Canvas自体は紙のイメージで常に白 */
+    touch-action: pan-x; /* 指でのスワイプは横スクロールに使う(描画はペン/マウスのみ) */
+  }
+  #canvasArea {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    padding-top: 44px; /* ヘッダー高さぶん */
+  }
+</style>
+</head>
+<body>
+
+<div id="header">
+  <h1>TPU-MINI 手書き</h1>
+  <button id="connectBtn" class="primary">接続</button>
+  <span id="connStatus" class="status disconnected">未接続</span>
+  <span id="liveInfo">--.- kPa / MODE: -</span>
+  <select id="wheelOrder">
+    <option value="0">FL始点</option>
+    <option value="1">FR始点</option>
+    <option value="2">RL始点</option>
+    <option value="3">RL始点・逆</option>
+    <option value="4">RR始点</option>
+  </select>
+  <span id="blockCount">0/50</span>
+  <button id="newBtn" class="danger">新規</button>
+  <button id="sendBtn" class="primary">送信</button>
+</div>
+<div id="sendStatus"></div>
+
+<div id="canvasArea">
+  <div id="scrollWrap">
+    <canvas id="sheetCanvas"></canvas>
+  </div>
+</div>
+
+<script>
+// =================================================================
+// TPU-MINI 手書きモード用 Webアプリ(初版)
+//
+// ★通常モード(tpu_mini_app.html、数値のみGAS送信)とは別ファイルとして分離。
+//   モード切替をアプリ内に持たせるとコードが長くなるため、あえて別アプリにしている。
+//   BLEのUUID・接続処理・測定順テーブルは通常モードと同じものをそのまま流用。
+//
+// ★設計方針の要点(会話で決めた内容):
+//   - 横スクロールの1枚のCanvasに、BLEで4輪確定するたびに「田」の字ブロック
+//     (4輪の値+確定時刻)を自動で右へ追加していく。
+//   - Canvasはタブレット1画面幅あたり2ブロック分の固定サイズ(50ブロック分=25画面分)を
+//     最初から確保し、以後は一切リサイズしない(Canvasのresizeで中身が消える問題を回避するため)。
+//   - 誤測定値の訂正はアプリ側の編集機能では行わず、送信機の表示を見ながら手書きで
+//     直接訂正する運用を前提にしている(訂正専用のUIは用意していない)。
+//   - 送信してもCanvasの内容はクリアされない(タイヤマンがずっと確認できるように)。
+//     送信は担当者が任意のタイミングで押す想定で、その時点のCanvas全体(スクロール外の
+//     見えていない部分も含む)を1枚の画像にしてGASへ送る。
+//   - アプリを開き直しても、明示的に「新規」ボタンを押さない限り前回の続きから使える。
+//     ブラウザのIndexedDBにCanvas全体を画像として保存・復元する(ベクターデータではなく
+//     ビットマップとして保存する簡易な方式)。
+//   - 手書きの入力はPointer Eventsで取得するが、指(touch)は横スクロールに使うため、
+//     描画として扱うのはペン/スタイラス(pointerType "pen")とマウス("mouse", 動作確認用)
+//     のみに限定している。これは会話の中で明示的に決めた内容ではなく、「指でスクロール」
+//     という方針から実装上の帰結として採用した割り当てなので、実機で使いにくければ調整すること。
+//   - 対象端末はiPad(Bluefy等が必要)・Androidタブレット両方、横向き(ランドスケープ)使用。
+//
+// ★未確定・要実機確認の項目:
+//   - ブロック上限(50)に達した場合の挙動(現状は警告を出して以降の自動追記を止めるだけ)。
+//   - Canvas全体のPNG化(toBlob)にかかる時間・データサイズ(ブロック数が多い場合)。
+//   - IndexedDBの保存タイミング(現状: ブロック追加時、および手書きストローク1本ごと)。
+//     頻度が高すぎる場合は間引きを検討。
+// =================================================================
+
+const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
+const LIVE_CHAR_UUID      = "12345678-1234-5678-1234-56789abcdef1";
+const CONFIRMED_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2";
+const MODE_CHAR_UUID      = "12345678-1234-5678-1234-56789abcdef3";
+
+// ★通常モードと同じGAS Web Appをそのまま使う(手書き用のtype="handwriting"分岐は
+//   既存doPost()側にgas_handwriting_addon.gsの内容を追記してある前提)。
+const GAS_URL = "https://script.google.com/macros/s/AKfycbzVkPtrjLQHoI61LLRGcJu7mJ58D-VdpwrOCB4kXyT_W8gUPw28EHwf2Yksgl8IIH33/exec";
+
+const WHEEL_ORDER_TABLE = [
+  ["FL", "RL", "RR", "FR"],
+  ["FR", "RR", "RL", "FL"],
+  ["RL", "FL", "FR", "RR"],
+  ["RL", "RR", "FR", "FL"],
+  ["RR", "RL", "FL", "FR"],
+];
+
+const MAX_BLOCKS = 50;          // ★1セッション最大20〜30回の想定に余裕を持たせた上限
+const BLOCKS_PER_PAGE = 2;      // ★タブレット1画面幅あたり2ブロック
+
+const DB_NAME = "tpu_mini_handwriting_db";
+const STORE_NAME = "state";
+const STATE_KEY = "current";
+
+const el = (id) => document.getElementById(id);
+const textDecoder = new TextDecoder("utf-8");
+
+let bleDevice = null;
+let bleServer = null;
+let lastKnownModeChar = "A";
+
+let wheelValues = {};
+let currentOrderIdx = 0;
+let blockIndex = 0;
+
+let canvas, ctx, scrollWrap;
+let dpr = window.devicePixelRatio || 1;
+let PAGE_W = 0, BLOCK_W = 0, CANVAS_W_CSS = 0, CANVAS_H_CSS = 0, GRID_H = 0;
+
+let drawing = false;
+let lastX = 0, lastY = 0;
+
+function currentWheelOrder() {
+  return WHEEL_ORDER_TABLE[parseInt(el("wheelOrder").value, 10)];
+}
+
+function resetWheelCollector() {
+  wheelValues = {};
+  currentOrderIdx = 0;
+  currentWheelOrder().forEach(w => wheelValues[w] = null);
+}
+
+// -----------------------------------------------------------------
+// Canvasの初期化(サイズは最初に一度だけ決めて、以後は変更しない)
+// -----------------------------------------------------------------
+function setupCanvas() {
+  canvas = el("sheetCanvas");
+  scrollWrap = el("scrollWrap");
+  ctx = canvas.getContext("2d");
+
+  PAGE_W = Math.max(600, Math.round(window.innerWidth));
+  BLOCK_W = PAGE_W / BLOCKS_PER_PAGE;
+  CANVAS_W_CSS = BLOCK_W * MAX_BLOCKS;
+  CANVAS_H_CSS = Math.max(300, window.innerHeight - 44);
+  GRID_H = CANVAS_H_CSS * 0.5;
+
+  canvas.style.width = CANVAS_W_CSS + "px";
+  canvas.style.height = CANVAS_H_CSS + "px";
+  canvas.width = Math.round(CANVAS_W_CSS * dpr);
+  canvas.height = Math.round(CANVAS_H_CSS * dpr);
+  ctx.scale(dpr, dpr); // 以後の描画はCSSピクセル座標で行う
+}
+
+function paintWhiteBackground() {
+  ctx.save();
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.restore();
+}
+
+function drawStaticGuides() {
+  ctx.save();
+  // ブロック境界(細線)
+  ctx.strokeStyle = "#e5e5e5";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < MAX_BLOCKS; i++) {
+    const x = i * BLOCK_W;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, CANVAS_H_CSS);
+    ctx.stroke();
+  }
+  // 画面(ページ)境界(太線)
+  ctx.strokeStyle = "#cfcfcf";
+  ctx.lineWidth = 2;
+  for (let i = 1; i * BLOCKS_PER_PAGE < MAX_BLOCKS; i++) {
+    const x = i * BLOCKS_PER_PAGE * BLOCK_W;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, CANVAS_H_CSS);
+    ctx.stroke();
+  }
+  // 自動記入ゾーン(上半分)と手書きゾーン(下半分)の区切り
+  ctx.strokeStyle = "#cfcfcf";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  ctx.moveTo(0, GRID_H);
+  ctx.lineTo(CANVAS_W_CSS, GRID_H);
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.restore();
+}
+
+function formatTimestamp(d) {
+  const p2 = (n) => String(n).padStart(2, "0");
+  return `${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+}
+
+// 「田」の字ブロックを1つ描く(4輪の値+確定時刻)
+function drawBlock(idx, values, timestampStr) {
+  const pad = 10;
+  const x0 = idx * BLOCK_W;
+  const gx = x0 + pad;
+  const gy = pad;
+  const gw = BLOCK_W - pad * 2;
+  const gh = GRID_H - pad * 2 - 16; // 下に時刻を書くぶんを残す
+
+  ctx.save();
+  ctx.strokeStyle = "#333";
+  ctx.lineWidth = 1.5;
+  ctx.strokeRect(gx, gy, gw, gh);
+  ctx.beginPath();
+  ctx.moveTo(gx + gw / 2, gy);
+  ctx.lineTo(gx + gw / 2, gy + gh);
+  ctx.moveTo(gx, gy + gh / 2);
+  ctx.lineTo(gx + gw, gy + gh / 2);
+  ctx.stroke();
+
+  const cellW = gw / 2, cellH = gh / 2;
+  const cells = [
+    { label: "FL", cx: gx + cellW * 0.5, cy: gy + cellH * 0.5, val: values.FL },
+    { label: "FR", cx: gx + cellW * 1.5, cy: gy + cellH * 0.5, val: values.FR },
+    { label: "RL", cx: gx + cellW * 0.5, cy: gy + cellH * 1.5, val: values.RL },
+    { label: "RR", cx: gx + cellW * 1.5, cy: gy + cellH * 1.5, val: values.RR },
+  ];
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  cells.forEach(c => {
+    ctx.fillStyle = "#999999";
+    ctx.font = "11px sans-serif";
+    ctx.fillText(c.label, c.cx, c.cy - 13);
+    ctx.fillStyle = "#111111";
+    ctx.font = "bold 17px sans-serif";
+    ctx.fillText(c.val != null ? c.val.toFixed(1) : "--.-", c.cx, c.cy + 5);
+  });
+
+  ctx.fillStyle = "#666666";
+  ctx.font = "10px sans-serif";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(timestampStr, gx, gy + gh + 14);
+  ctx.restore();
+}
+
+function updateBlockCountLabel() {
+  el("blockCount").textContent = `${blockIndex}/${MAX_BLOCKS}`;
+}
+
+function onConfirmedValue(kpa) {
+  const order = currentWheelOrder();
+  if (currentOrderIdx >= order.length) return;
+  const wheel = order[currentOrderIdx];
+  wheelValues[wheel] = kpa;
+  currentOrderIdx++;
+  if (currentOrderIdx >= order.length) {
+    if (blockIndex >= MAX_BLOCKS) {
+      alert("本日の上限(" + MAX_BLOCKS + "ブロック)に達しました。「新規」で次のシートを開始してください。");
+      resetWheelCollector();
+      return;
+    }
+    const wasNearEnd = isScrollNearEnd();
+    drawBlock(blockIndex, wheelValues, formatTimestamp(new Date()));
+    blockIndex++;
+    updateBlockCountLabel();
+    resetWheelCollector();
+    saveState();
+    if (wasNearEnd) scrollToLatest();
+  }
+}
+
+function isScrollNearEnd() {
+  const maxScroll = scrollWrap.scrollWidth - scrollWrap.clientWidth;
+  return (maxScroll - scrollWrap.scrollLeft) < BLOCK_W * 1.5;
+}
+
+function scrollToLatest() {
+  const target = Math.max(0, blockIndex * BLOCK_W - scrollWrap.clientWidth + BLOCK_W);
+  scrollWrap.scrollTo({ left: target, behavior: "smooth" });
+}
+
+// -----------------------------------------------------------------
+// 手書き入力(Pointer Events)。指(touch)は横スクロールに使うため描画対象外。
+// -----------------------------------------------------------------
+function getPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+}
+
+function onPointerDown(e) {
+  if (e.pointerType === "touch") return;
+  e.preventDefault();
+  drawing = true;
+  canvas.setPointerCapture(e.pointerId);
+  const p = getPos(e);
+  lastX = p.x; lastY = p.y;
+}
+
+function onPointerMove(e) {
+  if (!drawing || e.pointerType === "touch") return;
+  e.preventDefault();
+  const p = getPos(e);
+  ctx.save();
+  ctx.strokeStyle = "#111111";
+  ctx.lineWidth = 2;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.beginPath();
+  ctx.moveTo(lastX, lastY);
+  ctx.lineTo(p.x, p.y);
+  ctx.stroke();
+  ctx.restore();
+  lastX = p.x; lastY = p.y;
+}
+
+function onPointerEnd(e) {
+  if (!drawing) return;
+  drawing = false;
+  saveState();
+}
+
+// -----------------------------------------------------------------
+// IndexedDBへの保存・復元(Canvas全体をPNGビットマップとして扱う簡易方式)
+// -----------------------------------------------------------------
+function openDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE_NAME);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function saveState() {
+  try {
+    const blob = await new Promise(res => canvas.toBlob(res, "image/png"));
+    const db = await openDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).put({ blockIndex, imageBlob: blob, savedAt: Date.now() }, STATE_KEY);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.error("[TPU-MINI handwriting] saveState failed:", err);
+  }
+}
+
+async function loadState() {
+  try {
+    const db = await openDb();
+    const rec = await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readonly");
+      const req = tx.objectStore(STORE_NAME).get(STATE_KEY);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    if (rec && rec.imageBlob) {
+      const bitmap = await createImageBitmap(rec.imageBlob);
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(bitmap, 0, 0);
+      ctx.restore();
+      blockIndex = rec.blockIndex || 0;
+      updateBlockCountLabel();
+      return;
+    }
+  } catch (err) {
+    console.error("[TPU-MINI handwriting] loadState failed:", err);
+  }
+  // 保存データが無い場合は真っさらなCanvasを用意する
+  paintWhiteBackground();
+  drawStaticGuides();
+  blockIndex = 0;
+  updateBlockCountLabel();
+}
+
+async function startNew() {
+  if (!confirm("現在の記録をクリアして新しいシートを開始します。よろしいですか?")) return;
+  try {
+    const db = await openDb();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.objectStore(STORE_NAME).delete(STATE_KEY);
+      tx.oncomplete = resolve;
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.error("[TPU-MINI handwriting] startNew delete failed:", err);
+  }
+  paintWhiteBackground();
+  drawStaticGuides();
+  blockIndex = 0;
+  updateBlockCountLabel();
+  resetWheelCollector();
+  scrollWrap.scrollLeft = 0;
+}
+
+// -----------------------------------------------------------------
+// GASへの送信(画像のみ。Canvas全体をPNG化してbase64でPOST)
+// -----------------------------------------------------------------
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const s = reader.result;
+      resolve(s.substring(s.indexOf(",") + 1));
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+async function sendToGas() {
+  const statusEl = el("sendStatus");
+  statusEl.textContent = "画像を書き出し中...";
+  try {
+    const blob = await new Promise(res => canvas.toBlob(res, "image/png"));
+    const base64 = await blobToBase64(blob);
+    const payload = {
+      type: "handwriting",
+      timestamp: new Date().toISOString(),
+      imageBase64: base64,
+    };
+    statusEl.textContent = "送信中...";
+    const res = await fetch(GAS_URL, {
+      method: "POST",
+      headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify(payload),
+    });
+    statusEl.textContent = `送信完了 (HTTP ${res.status}) ${new Date().toLocaleTimeString("ja-JP")}`;
+    console.log("[TPU-MINI handwriting] sent to GAS, status:", res.status);
+  } catch (err) {
+    statusEl.textContent = "送信失敗: " + err.message;
+    console.error("[TPU-MINI handwriting] GAS send failed:", err);
+  }
+}
+
+// -----------------------------------------------------------------
+// BLE接続(通常モードと同じ接続処理)
+// -----------------------------------------------------------------
+function setConnected(connected) {
+  const statusEl = el("connStatus");
+  if (connected) {
+    statusEl.textContent = "接続中";
+    statusEl.className = "status connected";
+    el("connectBtn").textContent = "切断";
+  } else {
+    statusEl.textContent = "未接続";
+    statusEl.className = "status disconnected";
+    el("connectBtn").textContent = "接続";
+    el("liveInfo").textContent = "--.- kPa / MODE: -";
+  }
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    alert("このブラウザはWeb Bluetoothに対応していません。");
+    return;
+  }
+  try {
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ services: [SERVICE_UUID] }],
+    });
+    bleDevice.addEventListener("gattserverdisconnected", () => setConnected(false));
+
+    bleServer = await bleDevice.gatt.connect();
+    const service = await bleServer.getPrimaryService(SERVICE_UUID);
+
+    const liveChar = await service.getCharacteristic(LIVE_CHAR_UUID);
+    await liveChar.startNotifications();
+    let lastLiveText = "--.-";
+    liveChar.addEventListener("characteristicvaluechanged", (e) => {
+      lastLiveText = textDecoder.decode(e.target.value);
+      el("liveInfo").textContent = `${lastLiveText} kPa / MODE: ${lastKnownModeChar === "A" ? "AUTO" : "MANUAL"}`;
+    });
+
+    const confirmedChar = await service.getCharacteristic(CONFIRMED_CHAR_UUID);
+    await confirmedChar.startNotifications();
+    confirmedChar.addEventListener("characteristicvaluechanged", (e) => {
+      const text = textDecoder.decode(e.target.value);
+      const kpa = parseFloat(text);
+      if (!Number.isNaN(kpa)) onConfirmedValue(kpa);
+    });
+
+    const modeChar = await service.getCharacteristic(MODE_CHAR_UUID);
+    await modeChar.startNotifications();
+    modeChar.addEventListener("characteristicvaluechanged", (e) => {
+      lastKnownModeChar = textDecoder.decode(e.target.value);
+      el("liveInfo").textContent = `${lastLiveText} kPa / MODE: ${lastKnownModeChar === "A" ? "AUTO" : "MANUAL"}`;
+    });
+    try {
+      const initial = await modeChar.readValue();
+      lastKnownModeChar = textDecoder.decode(initial);
+    } catch (_) { /* 読めなくても致命的ではない */ }
+
+    setConnected(true);
+  } catch (err) {
+    console.error(err);
+    if (err.name !== "NotFoundError") {
+      alert("接続に失敗しました: " + err.message);
+    }
+  }
+}
+
+function disconnect() {
+  if (bleDevice && bleDevice.gatt.connected) {
+    bleDevice.gatt.disconnect();
+  }
+  setConnected(false);
+}
+
+// -----------------------------------------------------------------
+// 初期化
+// -----------------------------------------------------------------
+async function init() {
+  setupCanvas();
+  await loadState();
+
+  canvas.addEventListener("pointerdown", onPointerDown);
+  canvas.addEventListener("pointermove", onPointerMove);
+  canvas.addEventListener("pointerup", onPointerEnd);
+  canvas.addEventListener("pointercancel", onPointerEnd);
+  canvas.addEventListener("pointerleave", onPointerEnd);
+
+  el("connectBtn").addEventListener("click", () => {
+    if (bleDevice && bleDevice.gatt.connected) disconnect();
+    else connect();
+  });
+  el("wheelOrder").addEventListener("change", resetWheelCollector);
+  el("newBtn").addEventListener("click", startNew);
+  el("sendBtn").addEventListener("click", sendToGas);
+
+  resetWheelCollector();
+}
+
+init();
+</script>
+
+</body>
+</html>
