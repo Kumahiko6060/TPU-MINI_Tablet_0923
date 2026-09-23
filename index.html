@@ -629,6 +629,12 @@ async function init() {
   canvas.addEventListener("pointerup", onPointerEnd);
   canvas.addEventListener("pointercancel", onPointerEnd);
   canvas.addEventListener("pointerleave", onPointerEnd);
+  // ★Safari系ブラウザではtouch-action:noneをJSで動的に切り替えても、指で触れた瞬間に
+  //   先に横スクロールとして処理されてしまい、pointer系イベントがpointercancelで
+  //   打ち切られることがある。ネイティブのtouchstart/touchmoveでも{passive:false}で
+  //   明示的にpreventDefault()しておくことで、固定中は確実にスクロールを止める(二重対策)。
+  canvas.addEventListener("touchstart", (e) => { if (scrollLocked) e.preventDefault(); }, { passive: false });
+  canvas.addEventListener("touchmove", (e) => { if (scrollLocked) e.preventDefault(); }, { passive: false });
 
   el("connectBtn").addEventListener("click", () => {
     if (bleDevice && bleDevice.gatt.connected) disconnect();
