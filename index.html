@@ -90,8 +90,9 @@
   #scrollWrap {
     position: absolute;
     inset: 0;
-    overflow-x: hidden; /* ネイティブスクロールは使わず、JSでscrollLeftを直接動かす */
+    overflow-x: auto;  /* ネイティブスクロール(モーメンタム付き)を使う */
     overflow-y: hidden;
+    -webkit-overflow-scrolling: touch;
   }
   #pagesRow {
     display: flex;
@@ -101,7 +102,9 @@
     display: block;
     flex: 0 0 auto;
     background: #ffffff; /* Canvas自体は紙のイメージで常に白 */
-    touch-action: none;  /* 指の挙動(描画/パン)は全てJS側で判定・処理する */
+    touch-action: pan-x; /* 初期状態(固定OFF)は指のドラッグをネイティブの横スクロールに使う。
+                             「固定」ON中はJSでnoneに切り替え、指を描画に使う(createPageCanvas/
+                             toggleScrollLock参照) */
     border-right: 2px solid #cfcfcf; /* 画面(ページ)の区切り */
   }
 </style>
@@ -169,12 +172,21 @@
 //   複数のCanvas要素を横に並べる(displex:flexの行)ことで、見た目上は1本の帯として
 //   スクロールできる。
 //
-//   横スクロールの実現方法も、ブラウザ任せ(touch-action)ではなく、JS側で
-//   scrollWrap.scrollLeftを直接操作する方式にしている(指はロックOFF中はパン、
-//   ロックON中は描画、とJSが完全に判定する)。
+// ★第3版での変更点:
+//   第2版では横スクロールをJS側でscrollWrap.scrollLeftを直接操作する方式にしていたが、
+//   iPad実機で「描画はできるようになったが、今度は横スクロールが効かない」という報告が
+//   あった。overflow:hiddenな要素へのscrollLeft代入がiOS Safariで反映されないことがある、
+//   という既知の挙動が原因とみられる。ページ分割でCanvas自体は正しく描画できるように
+//   なったため、横スクロールは素直にブラウザのネイティブ実装(overflow-x:auto +
+//   touch-action)に戻した方が確実と判断した。
+//   - 指(touch): 「固定」OFF中はtouch-action:pan-xでネイティブの横スクロール(モーメンタム
+//     付き)に任せる。「固定」ON中はtouch-action:noneに切り替え、指をPointer Eventsでの
+//     描画に使う(toggleScrollLock/createPageCanvasでページごとに反映)。
+//   - ペン/マウスは常に描画。
 //
 // ★未確認・要実機再確認の項目:
-//   - 今回の修正(ページ分割)でiPad実機の描画・区切り線表示・スクロールが直るかどうか。
+//   - 今回の修正(ネイティブスクロールに戻した)でiPad実機の横スクロールが直るかどうか。
+//   - ページ分割によるCanvas描画・区切り線表示は前回の修正で改善済み(実機で確認取れた)。
 //   - ブロック上限(50)に達した場合の挙動(現状は警告を出して以降の自動追記を止めるだけ)。
 //   - 送信時、多数ページ(理論上最大25ページ)を1枚に結合する際のCanvasサイズ(結合用
 //     Canvasはdpr=1固定で書き出しているが、それでも大きい場合は要調整)。
@@ -221,10 +233,9 @@ let PAGE_W_CSS = 0, PAGE_H_CSS = 0, BLOCK_W_CSS = 0, GRID_H = 0;
 
 let pages = []; // pages[pageIdx] = { canvas, ctx } ※実際に使われた分だけ生成する
 
-let mode = null; // 現在進行中のポインタ操作: "draw"(描画) | "pan"(横スクロール) | null
+let mode = null; // 現在進行中のポインタ操作: "draw"(描画) | null(横スクロールはネイティブに任せる)
 let lastX = 0, lastY = 0;             // 描画時: 対象Canvas内座標(CSS px)
-let lastPanClientX = 0;               // パン時: 画面(viewport)基準のX座標
-let scrollLocked = false;             // ★「固定」ボタンで切替。固定中は指も描画に使う(パンは無効)
+let scrollLocked = false;             // ★「固定」ボタンで切替。固定中は指も描画に使う(横スクロール無効)
 let activeCanvas = null, activeCtx = null; // 現在描画中のページCanvas
 
 function currentWheelOrder() {
@@ -296,6 +307,7 @@ function createPageCanvas(pageIdx) {
   c.style.height = PAGE_H_CSS + "px";
   c.width = Math.round(PAGE_W_CSS * dpr);
   c.height = Math.round(PAGE_H_CSS * dpr);
+  c.style.touchAction = scrollLocked ? "none" : "pan-x"; // ★今の固定状態を新しいページにも反映
   const ctx = c.getContext("2d");
   ctx.scale(dpr, dpr);
   pagesRow.appendChild(c);
@@ -408,9 +420,13 @@ function scrollToLatest() {
 // -----------------------------------------------------------------
 // 手書き入力(Pointer Events)。
 //   - ペン/マウス: 常に描画。
-//   - 指(touch): 「固定」ボタンがOFFの間はパン(横スクロール)、ONの間は描画。
-//   横スクロールはブラウザ任せ(touch-action)にせず、JS側でscrollWrap.scrollLeftを
-//   直接操作している(ブラウザのジェスチャー判定と競合させないため)。
+//   - 指(touch): 「固定」ボタンがOFFの間はネイティブの横スクロール(touch-action:pan-x)に
+//     任せる(何もしない)。ONの間はtouch-action:noneに切り替えて指を描画に使う。
+//   ★初版はJS側でscrollLeftを手動操作する方式を試したが、iPad実機で「描画はできるが
+//     スクロールが効かない」問題が出た(overflow:hiddenな要素へのscrollLeft代入は
+//     iOS Safariで反映されないことがある、という既知の挙動が原因とみられる)。
+//     ページ分割でCanvas自体は正しく描画できるようになったため、横スクロールは
+//     素直にブラウザのネイティブ実装(touch-action)に戻した方が確実と判断した。
 // -----------------------------------------------------------------
 function getPos(e, canvasEl) {
   const rect = canvasEl.getBoundingClientRect();
@@ -418,15 +434,11 @@ function getPos(e, canvasEl) {
 }
 
 function onPointerDown(e, canvasEl) {
+  if (e.pointerType === "touch" && !scrollLocked) {
+    return; // 固定OFF中の指はネイティブの横スクロールに任せる
+  }
   e.preventDefault();
   canvasEl.setPointerCapture(e.pointerId);
-
-  if (e.pointerType === "touch" && !scrollLocked) {
-    mode = "pan";
-    lastPanClientX = e.clientX;
-    return;
-  }
-
   mode = "draw";
   activeCanvas = canvasEl;
   activeCtx = canvasEl.getContext("2d");
@@ -435,28 +447,20 @@ function onPointerDown(e, canvasEl) {
 }
 
 function onPointerMove(e) {
-  if (mode === "pan") {
-    e.preventDefault();
-    const delta = e.clientX - lastPanClientX;
-    scrollWrap.scrollLeft -= delta;
-    lastPanClientX = e.clientX;
-    return;
-  }
-  if (mode === "draw" && activeCtx) {
-    e.preventDefault();
-    const p = getPos(e, activeCanvas);
-    activeCtx.save();
-    activeCtx.strokeStyle = "#111111";
-    activeCtx.lineWidth = 2;
-    activeCtx.lineCap = "round";
-    activeCtx.lineJoin = "round";
-    activeCtx.beginPath();
-    activeCtx.moveTo(lastX, lastY);
-    activeCtx.lineTo(p.x, p.y);
-    activeCtx.stroke();
-    activeCtx.restore();
-    lastX = p.x; lastY = p.y;
-  }
+  if (mode !== "draw" || !activeCtx) return;
+  e.preventDefault();
+  const p = getPos(e, activeCanvas);
+  activeCtx.save();
+  activeCtx.strokeStyle = "#111111";
+  activeCtx.lineWidth = 2;
+  activeCtx.lineCap = "round";
+  activeCtx.lineJoin = "round";
+  activeCtx.beginPath();
+  activeCtx.moveTo(lastX, lastY);
+  activeCtx.lineTo(p.x, p.y);
+  activeCtx.stroke();
+  activeCtx.restore();
+  lastX = p.x; lastY = p.y;
 }
 
 function onPointerEnd(e) {
@@ -464,6 +468,11 @@ function onPointerEnd(e) {
   mode = null;
   activeCanvas = null;
   activeCtx = null;
+}
+
+function applyTouchActionToAllPages() {
+  const val = scrollLocked ? "none" : "pan-x";
+  pages.forEach(p => { p.canvas.style.touchAction = val; });
 }
 
 function toggleScrollLock() {
@@ -476,6 +485,7 @@ function toggleScrollLock() {
     btn.textContent = "固定";
     btn.classList.remove("active");
   }
+  applyTouchActionToAllPages(); // 既存の全ページへ即反映(新規ページはcreatePageCanvas側で反映)
 }
 
 // -----------------------------------------------------------------
