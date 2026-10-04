@@ -85,17 +85,9 @@
   #batInfo.chg  { color: #22d3ee; }
   #unitToggleBtn { width: 52px; }
   /* 電池の催促帯: 書く領域の上に重ねる(差し込まないのでCanvasの大きさ・位置は変わらない) */
-  /* ★v6.6: 元の写真を保存するボタン(撮影後に右下へ出す) */
-  #origSaveBar {
-    position: absolute;
-    right: 12px; bottom: 12px;
-    z-index: 55;
-    display: none;
-    gap: 6px;
-  }
-  #origSaveBar.show { display: flex; }
-  #origSaveBar button { box-shadow: 0 2px 8px rgba(0,0,0,0.4); }
-  #origSaveBtn { background: #15803d; border-color: #15803d; font-size: 15px; padding: 12px 16px; }
+  /* ★v6.7: 元の写真をまとめて保存するヘッダーのボタン(文字が変わっても幅は固定) */
+  #origSaveBtn { width: 108px; white-space: nowrap; }
+  #origSaveBtn.has { background: #15803d; border-color: #15803d; }
   #batBanner {
     position: absolute;
     left: 0; right: 0; top: 0;
@@ -288,6 +280,7 @@
     <span id="pageIndicator">0/0</span>
     <button id="nextBtn">▶</button>
   </div>
+  <button id="origSaveBtn" disabled>写真保存 0</button>
   <button id="settingsBtn">設定</button>
   <button id="newBtn" class="danger">新規</button>
   <button id="sendBtn" class="primary">送信</button>
@@ -297,10 +290,6 @@
 <div id="canvasArea">
   <div id="pagesHost"></div>
   <div id="batBanner"></div>
-  <div id="origSaveBar">
-    <button id="origSaveBtn">元の写真を保存</button>
-    <button id="origSaveDismiss" title="保存しない">✕</button>
-  </div>
   <div id="dbgLog">確認用: 届いた通知をここに表示します</div>
   <div id="emptyHint">BLE接続後、1輪目が確定すると自動でページが作成されます</div>
 </div>
@@ -353,6 +342,17 @@
 
     <div class="settings-section">
       <button id="settingsClose" class="primary" style="width:100%;">閉じる</button>
+    </div>
+  </div>
+</div>
+
+<div id="origNewModal" class="modal-overlay">
+  <div class="modal-box">
+    <p id="origNewMsg">保存していない元の写真があります。</p>
+    <div class="modal-actions">
+      <button id="origNewSave" class="primary">写真を保存する</button>
+      <button id="origNewDiscard" class="danger">保存せずに新規へ進む</button>
+      <button id="origNewCancel">キャンセル</button>
     </div>
   </div>
 </div>
@@ -499,7 +499,12 @@
 //   撮影して「写真を使用」を押すと、ページに縮小して貼るのに加えて、元の写真を保存待ちにし、
 //   右下に「元の写真を保存」ボタンを出す。タップすると共有画面が開くので「画像を保存」を選ぶ
 //   (複数枚たまっていれば一度に保存できる)。共有画面を開けない時は1枚ずつ表示して長押しで保存。
-//   ファイル名は TPU_P<ページ>_<輪>_<日時>.jpg。✕で保存せず破棄。保存待ちはアプリを閉じると消える。
+//   ファイル名は TPU_P<ページ>_<輪>_<日時>.jpg。保存待ちはアプリを閉じると消える。
+//
+// ★v6.7での変更点:
+//   撮影のたびに右下へ保存ボタンを出すのをやめ、ヘッダーに常設の「写真保存 N」ボタン(Nは保存待ちの枚数)を
+//   置いた。好きな時に押すと、たまった元の写真をまとめて共有画面へ渡す。
+//   保存待ちがある時に「新規」を押すと「写真を保存する/保存せずに新規へ進む/キャンセル」を聞く。
 // =================================================================
 
 const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
@@ -536,7 +541,7 @@ const WHEEL_ORDER_TABLE = [
 // ★どのバージョンのファイルを開いているか実機側で見分けられるよう、画面に小さく表示する
 //   (「新しいファイルを送ったのに変化がない」という時、古いファイルを開いたままになっていないか
 //   確認しやすくするための目印。変更のたびにここを更新する)。
-const BUILD_TAG = "手書き v6.6 元の写真を保存";
+const BUILD_TAG = "手書き v6.7 写真まとめて保存";
 
 const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
 const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
@@ -1098,16 +1103,17 @@ function queueOriginalPhoto(file, page, wheel) {
   renderOrigSaveBar();
 }
 
+// ★v6.7: 撮影のたびにボタンを出すのをやめ、ヘッダーの「写真保存 N」に枚数を出すだけにした
 function renderOrigSaveBar() {
-  const bar = el("origSaveBar");
-  if (origQueue.length === 0) { bar.classList.remove("show"); return; }
-  el("origSaveBtn").textContent = origQueue.length === 1
-    ? `元の写真を保存 (${origQueue[0].label})` : `元の写真を保存 (${origQueue.length}枚)`;
-  bar.classList.add("show");
+  const btn = el("origSaveBtn");
+  btn.textContent = `写真保存 ${origQueue.length}`;
+  btn.disabled = origQueue.length === 0;
+  btn.classList.toggle("has", origQueue.length > 0);
 }
 
+// 戻り値: 保存待ちが空になったか(=保存できた/元から無い)
 async function onOrigSaveClick() {
-  if (origQueue.length === 0) return;
+  if (origQueue.length === 0) return true;
   const files = origQueue.map(q => q.file);
   const canShareFiles = !!(navigator.share && navigator.canShare && navigator.canShare({ files }));
   if (canShareFiles) {
@@ -1115,13 +1121,14 @@ async function onOrigSaveClick() {
       await navigator.share({ files });
       origQueue = [];            // 共有画面で保存(または他のアプリへ送信)が済んだ
       renderOrigSaveBar();
-      return;
+      return true;
     } catch (err) {
-      if (err && err.name === "AbortError") return;   // キャンセル → 保存待ちのまま残す
+      if (err && err.name === "AbortError") return false;   // キャンセル → 保存待ちのまま残す
       console.warn("[TPU-MINI handwriting] share failed, fallback to long-press:", err);
     }
   }
   openOrigViewer();   // 共有画面が使えない → 長押しで保存してもらう
+  return false;
 }
 
 let origViewUrl = null;
@@ -1142,11 +1149,12 @@ function closeOrigViewer() {
   el("origViewModal").style.display = "none";
   if (origViewUrl) { URL.revokeObjectURL(origViewUrl); origViewUrl = null; }
 }
-function onOrigDismiss() {
-  if (!confirm(`保存していない元の写真(${origQueue.length}枚)を破棄しますか？\n(ページに貼った写真はそのまま残ります)`)) return;
-  origQueue = [];
-  renderOrigSaveBar();
+// ★v6.7: 「新規」の前に、保存していない元の写真があれば知らせる
+function showOrigNewModal() {
+  el("origNewMsg").textContent = `保存していない元の写真が${origQueue.length}枚あります。新規にすると消えます。先に保存しますか？`;
+  el("origNewModal").style.display = "flex";
 }
+function hideOrigNewModal() { el("origNewModal").style.display = "none"; }
 
 // -----------------------------------------------------------------
 // IndexedDBへの保存・復元(各ページをPNGビットマップとして保存する簡易方式)
@@ -1264,6 +1272,8 @@ async function clearAllAndStartFresh() {
   currentPageIdx = -1;
   collectingPageIdx = -1;
   hasContent = false;
+  origQueue = [];            // ★v6.7: 保存待ちの元の写真も消す
+  renderOrigSaveBar();
   createEmptyPage();
   showPage(0);
   resetWheelCollector();
@@ -1274,6 +1284,11 @@ function showConfirmModal() { el("confirmModal").style.display = "flex"; }
 function hideConfirmModal() { el("confirmModal").style.display = "none"; }
 
 async function onNewBtnClick() {
+  if (origQueue.length > 0) { showOrigNewModal(); return; }   // ★v6.7: 元の写真の保存忘れ防止
+  await continueNewAfterOrigCheck();
+}
+
+async function continueNewAfterOrigCheck() {
   if (!hasUnsentContent()) {
     await clearAllAndStartFresh();
     return;
@@ -1914,7 +1929,16 @@ async function init() {
   el("photoViewClose").addEventListener("click", closePhotoViewer);
   // ★v6.6: 元の写真の保存
   el("origSaveBtn").addEventListener("click", onOrigSaveClick);
-  el("origSaveDismiss").addEventListener("click", onOrigDismiss);
+  el("origNewSave").addEventListener("click", async () => {
+    const done = await onOrigSaveClick();   // タップの直後に共有画面を開く
+    if (done) { hideOrigNewModal(); await continueNewAfterOrigCheck(); }
+    else hideOrigNewModal();                // キャンセル/長押し保存へ切替 → 新規は中止(もう一度押してもらう)
+  });
+  el("origNewDiscard").addEventListener("click", async () => {
+    origQueue = []; renderOrigSaveBar(); hideOrigNewModal();
+    await continueNewAfterOrigCheck();
+  });
+  el("origNewCancel").addEventListener("click", hideOrigNewModal);
   el("origViewNext").addEventListener("click", onOrigViewNext);
   el("origViewClose").addEventListener("click", closeOrigViewer);
   el("photoViewRetake").addEventListener("click", () => {
