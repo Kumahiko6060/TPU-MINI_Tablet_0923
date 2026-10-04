@@ -271,7 +271,7 @@
 <div id="canvasArea">
   <div id="pagesHost"></div>
   <div id="batBanner"></div>
-  <div id="emptyHint">BLE接続後、4輪分の測定が完了すると自動で1ページ目が作成されます</div>
+  <div id="emptyHint">BLE接続後、1輪目が確定すると自動でページが作成されます</div>
 </div>
 
 <input type="file" id="photoInput" accept="image/*" capture="environment" style="display:none">
@@ -418,6 +418,15 @@
 //   v6.3では通知を oncharacteristicvaluechanged への代入で受けていたが、Bluefyはこれに
 //   対応していないとみられるため、addEventListener に戻した。再接続時の二重登録は、
 //   登録済みのcharacteristicを覚えておく(WeakSet)ことで防ぐ(onNotify関数)。
+//
+// ★v6.4での変更点(確定値を1輪ずつ表示):
+//   - 1輪目の確定で新しいページを作り、以降は確定するたびに田の字のマスへ値を書き足す。
+//     描き直すのは該当マス(と枠を付け外しするマス)の内側だけなので、他のマス・田の字の外の
+//     手書きや写真は消えない(ただし描き直したマスの内側に書いた手書きは消える)。
+//   - 次に測る輪のマスを青い太枠で示し、4輪目の確定で消す(送信画像に枠は残らない)。
+//   - 田の字の下の時刻は4輪目の確定時刻(3輪目までは空欄)。
+//   - 測定の途中経過(測定順・確定済みの値・途中のページ)もIndexedDBに保存し、開き直しても続きから測れる。
+//   - 測定順を途中で変えたら、途中のページの枠を消して、次の確定から新しいページにする。
 // =================================================================
 
 const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
@@ -451,7 +460,7 @@ const WHEEL_ORDER_TABLE = [
 // ★どのバージョンのファイルを開いているか実機側で見分けられるよう、画面に小さく表示する
 //   (「新しいファイルを送ったのに変化がない」という時、古いファイルを開いたままになっていないか
 //   確認しやすくするための目印。変更のたびにここを更新する)。
-const BUILD_TAG = "手書き v6.3.1 Bluefy通知対応";
+const BUILD_TAG = "手書き v6.4 1輪ずつ表示";
 
 const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
 const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
@@ -495,7 +504,18 @@ function currentWheelOrder() {
   return WHEEL_ORDER_TABLE[parseInt(el("wheelOrder").value, 10)];
 }
 
+// ★v6.4: 測定途中のページ(1輪目確定で作成、4輪目確定まで値を書き足していく)のindex。無ければ-1
+let collectingPageIdx = -1;
+
+// 測定の途中経過をリセットする。途中のページがあれば「次の輪」の枠だけ消す(書いた値はそのまま残す)。
 function resetWheelCollector() {
+  const p = pages[collectingPageIdx];
+  if (p && p.nextWheel) {
+    const w = p.nextWheel;
+    p.nextWheel = null;
+    redrawCell(p, w);
+  }
+  collectingPageIdx = -1;
   wheelValues = {};
   currentOrderIdx = 0;
   currentWheelOrder().forEach(w => wheelValues[w] = null);
@@ -551,7 +571,64 @@ function formatPressure(kpa, unit) {
 }
 
 // ★文字サイズはユーザー要望で従来の約2倍(ラベル12px→22px、値20px→36px)にしている。
-function drawGridBox(ctx, values, timestampStr) {
+const NEXT_WHEEL_COLOR = "#2f6fed"; // ★v6.4: 次に測る輪のマスの枠の色
+const NEXT_WHEEL_LINE = 5;
+
+function cellRect(wheel) {
+  const r = GRID_RECT, cw = r.w / 2, ch = r.h / 2;
+  const col = (wheel === "FR" || wheel === "RR") ? 1 : 0;
+  const row = (wheel === "RL" || wheel === "RR") ? 1 : 0;
+  return { x: r.x + cw * col, y: r.y + ch * row, w: cw, h: ch };
+}
+
+// 1マス分の中身(ラベル・値・次の輪の枠)を描く。消去はしない。
+function drawCellContent(ctx, wheel, val, highlight) {
+  const c = cellRect(wheel);
+  const cx = c.x + c.w / 2, cy = c.y + c.h / 2;
+  ctx.save();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = "#999999";
+  ctx.font = "22px sans-serif";
+  ctx.fillText(wheel, cx, cy - 26);
+  ctx.fillStyle = "#111111";
+  ctx.font = "bold 36px sans-serif";
+  ctx.fillText(formatPressure(val, displayUnit), cx, cy + 10);
+  if (highlight) {
+    const ins = 3 + NEXT_WHEEL_LINE / 2;
+    ctx.strokeStyle = NEXT_WHEEL_COLOR;
+    ctx.lineWidth = NEXT_WHEEL_LINE;
+    ctx.strokeRect(c.x + ins, c.y + ins, c.w - ins * 2, c.h - ins * 2);
+  }
+  ctx.restore();
+}
+
+// ★v6.4: 1マスだけ白で消して描き直す(他のマス・周囲の手書き/写真には触れない)。
+//   田の字の線を消さないよう、線の内側だけを消す。
+function redrawCell(page, wheel) {
+  const c = cellRect(wheel);
+  const ins = 1.5;
+  const ctx = page.ctx;
+  ctx.save();
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(c.x + ins, c.y + ins, c.w - ins * 2, c.h - ins * 2);
+  ctx.restore();
+  drawCellContent(ctx, wheel, page.values[wheel], page.nextWheel === wheel);
+}
+
+function drawTimestamp(ctx, timestampStr) {
+  if (!timestampStr) return;
+  const r = GRID_RECT;
+  ctx.save();
+  ctx.fillStyle = "#666666";
+  ctx.font = "16px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  ctx.fillText(`${timestampStr}  (${displayUnit})`, r.x + r.w / 2, r.y + r.h + 26);
+  ctx.restore();
+}
+
+function drawGridBox(ctx, values, timestampStr, nextWheel) {
   const r = GRID_RECT;
   ctx.save();
   ctx.strokeStyle = "#333";
@@ -563,32 +640,9 @@ function drawGridBox(ctx, values, timestampStr) {
   ctx.moveTo(r.x, r.y + r.h / 2);
   ctx.lineTo(r.x + r.w, r.y + r.h / 2);
   ctx.stroke();
-
-  const cellW = r.w / 2, cellH = r.h / 2;
-  const cells = [
-    { label: "FL", cx: r.x + cellW * 0.5, cy: r.y + cellH * 0.5, val: values.FL },
-    { label: "FR", cx: r.x + cellW * 1.5, cy: r.y + cellH * 0.5, val: values.FR },
-    { label: "RL", cx: r.x + cellW * 0.5, cy: r.y + cellH * 1.5, val: values.RL },
-    { label: "RR", cx: r.x + cellW * 1.5, cy: r.y + cellH * 1.5, val: values.RR },
-  ];
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  cells.forEach(c => {
-    ctx.fillStyle = "#999999";
-    ctx.font = "22px sans-serif";
-    ctx.fillText(c.label, c.cx, c.cy - 26);
-    ctx.fillStyle = "#111111";
-    ctx.font = "bold 36px sans-serif";
-    ctx.fillText(formatPressure(c.val, displayUnit), c.cx, c.cy + 10);
-  });
-
-  ctx.fillStyle = "#666666";
-  ctx.font = "16px sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "alphabetic";
-  const unitSuffix = timestampStr ? `  (${displayUnit})` : "";
-  ctx.fillText(timestampStr + unitSuffix, r.x + r.w / 2, r.y + r.h + 26);
   ctx.restore();
+  ["FL", "FR", "RL", "RR"].forEach(w => drawCellContent(ctx, w, values[w], nextWheel === w));
+  drawTimestamp(ctx, timestampStr);
 }
 
 // 単位(kPa/bar)切替時、田の字部分だけを白で消してから再描画する(周囲の手書き/写真は残す)。
@@ -598,7 +652,7 @@ function redrawGridArea(page) {
   ctx.fillStyle = "#ffffff";
   ctx.fillRect(GRID_CLEAR_RECT.x, GRID_CLEAR_RECT.y, GRID_CLEAR_RECT.w, GRID_CLEAR_RECT.h);
   ctx.restore();
-  drawGridBox(ctx, page.values, page.timestampStr);
+  drawGridBox(ctx, page.values, page.timestampStr, page.nextWheel);
 }
 
 function setDisplayUnit(unit) {
@@ -644,7 +698,7 @@ function freshPhotoFilledState() {
 
 // まだ測定値が無い空のページを1枚作る(アプリ起動直後や「新規」直後に用意しておく)。
 // BLE接続前でも手書き/写真だけ先に試せるようにするための土台で、値は「--.-」表示のまま。
-// これ自体は測定1回分としてカウントしない(BLEで4輪揃うと別途createMeasuredPageで
+// これ自体は測定1回分としてカウントしない(BLEで1輪目が確定すると別途createMeasuringPageで
 // 新しいページが追加される。このページは車番・注記などの自由記入用としても使える)。
 function createEmptyPage() {
   const { canvas, ctx } = makeCanvasEl();
@@ -653,21 +707,21 @@ function createEmptyPage() {
   paintPageBackground(canvas, ctx);
   drawGridBox(ctx, values, timestampStr);
   ["FL", "FR", "RL", "RR"].forEach(w => drawPhotoPlaceholder(ctx, w, PHOTO_RECTS[w]));
-  const page = { canvas, ctx, photoFilled: freshPhotoFilledState(), values, timestampStr };
+  const page = { canvas, ctx, photoFilled: freshPhotoFilledState(), values, timestampStr, nextWheel: null };
   attachInputHandlers(canvas, page);
   pages.push(page);
   return page;
 }
 
-// BLE確定の4輪値から新しいページを1枚作る(=1回の測定)。
-// 元のkPa値(values)とタイムスタンプはページに保持しておき、後で単位(kPa/bar)を
-// 切り替えた時に田の字部分だけ再描画できるようにする。
-function createMeasuredPage(values, timestampStr) {
+// ★v6.4: 1輪目の確定で新しいページを1枚作る(=1回の測定)。以降の輪は確定のたびにマスへ書き足す。
+// 元のkPa値(values)・次に測る輪(nextWheel)・タイムスタンプ(4輪目確定時に設定)はページに保持しておき、
+// 単位(kPa/bar)を切り替えた時や1マス描き直す時に使う。
+function createMeasuringPage(values, nextWheel) {
   const { canvas, ctx } = makeCanvasEl();
   paintPageBackground(canvas, ctx);
-  drawGridBox(ctx, values, timestampStr);
+  drawGridBox(ctx, values, "", nextWheel);
   ["FL", "FR", "RL", "RR"].forEach(w => drawPhotoPlaceholder(ctx, w, PHOTO_RECTS[w]));
-  const page = { canvas, ctx, photoFilled: freshPhotoFilledState(), values, timestampStr };
+  const page = { canvas, ctx, photoFilled: freshPhotoFilledState(), values, timestampStr: "", nextWheel };
   attachInputHandlers(canvas, page);
   pages.push(page);
   return page;
@@ -679,7 +733,7 @@ function createBlankPageForRestore() {
   const { canvas, ctx } = makeCanvasEl();
   const page = {
     canvas, ctx, photoFilled: freshPhotoFilledState(),
-    values: { FL: null, FR: null, RL: null, RR: null }, timestampStr: "",
+    values: { FL: null, FR: null, RL: null, RR: null }, timestampStr: "", nextWheel: null,
   };
   attachInputHandlers(canvas, page);
   pages.push(page);
@@ -718,24 +772,47 @@ function updateNavButtons() {
 function goPrev() { showPage(currentPageIdx - 1); }
 function goNext() { showPage(currentPageIdx + 1); }
 
+// ★v6.4: 確定値を1輪ずつページに書き込む。
+//   1輪目 → 新しいページを作って表示を切り替え、次の輪のマスに枠を付ける。
+//   2〜3輪目 → そのページの該当マスと枠のマスだけを描き直す(他の部分の手書き・写真は触らない)。
+//   4輪目 → 値を書き、枠を消し、田の字の下に4輪目の確定時刻を書き込む。
 function onConfirmedValue(kpa) {
   const order = currentWheelOrder();
   if (currentOrderIdx >= order.length) return;
-  const wheel = order[currentOrderIdx];
-  wheelValues[wheel] = kpa;
-  currentOrderIdx++;
-  if (currentOrderIdx >= order.length) {
+
+  let page = pages[collectingPageIdx];
+  if (currentOrderIdx === 0 || !page) {
     if (pages.length >= MAX_PAGES) {
       alert(`本日の上限(${MAX_PAGES}ページ)に達しました。「新規」で次のシートを開始してください。`);
       resetWheelCollector();
       return;
     }
-    createMeasuredPage({ ...wheelValues }, formatTimestamp(new Date()));
-    showPage(pages.length - 1); // 新規ページへ自動で表示切り替え
-    hasContent = true;
-    resetWheelCollector();
-    saveState();
+    currentOrderIdx = 0;
+    order.forEach(w => wheelValues[w] = null);
+    page = createMeasuringPage({ FL: null, FR: null, RL: null, RR: null }, order[0]);
+    collectingPageIdx = pages.length - 1;
   }
+
+  const wheel = order[currentOrderIdx];
+  wheelValues[wheel] = kpa;
+  page.values = { ...page.values, [wheel]: kpa };
+  currentOrderIdx++;
+
+  const prevNext = page.nextWheel;
+  page.nextWheel = currentOrderIdx < order.length ? order[currentOrderIdx] : null;
+  redrawCell(page, wheel);
+  if (prevNext && prevNext !== wheel) redrawCell(page, prevNext);
+  if (page.nextWheel) redrawCell(page, page.nextWheel);
+
+  if (currentOrderIdx >= order.length) {
+    page.timestampStr = formatTimestamp(new Date());
+    drawTimestamp(page.ctx, page.timestampStr);
+  }
+
+  showPage(collectingPageIdx); // 測定中のページへ自動で表示切り替え
+  hasContent = true;
+  if (currentOrderIdx >= order.length) resetWheelCollector();
+  saveState();
 }
 
 // -----------------------------------------------------------------
@@ -926,12 +1003,17 @@ async function saveState() {
     for (const p of pages) {
       const blob = await new Promise(res => p.canvas.toBlob(res, "image/png"));
       pageBlobs.push(blob);
-      pageMeta.push({ photoFilled: p.photoFilled, values: p.values, timestampStr: p.timestampStr });
+      pageMeta.push({ photoFilled: p.photoFilled, values: p.values, timestampStr: p.timestampStr, nextWheel: p.nextWheel || null });
     }
     const db = await openDb();
     await new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, "readwrite");
-      tx.objectStore(STORE_NAME).put({ pageBlobs, pageMeta, currentPageIdx, hasContent, displayUnit, savedAt: Date.now() }, STATE_KEY);
+      tx.objectStore(STORE_NAME).put({
+        pageBlobs, pageMeta, currentPageIdx, hasContent, displayUnit,
+        // ★v6.4: 測定の途中経過(開き直しても続きから測れるように)
+        collector: { orderIdx: el("wheelOrder").value, wheelValues, currentOrderIdx, collectingPageIdx },
+        savedAt: Date.now(),
+      }, STATE_KEY);
       tx.oncomplete = resolve;
       tx.onerror = () => reject(tx.error);
     });
@@ -961,6 +1043,17 @@ async function loadState() {
         if (meta && meta.photoFilled) page.photoFilled = meta.photoFilled;
         if (meta && meta.values) page.values = meta.values;
         if (meta && meta.timestampStr !== undefined) page.timestampStr = meta.timestampStr;
+        if (meta && meta.nextWheel) page.nextWheel = meta.nextWheel;
+      }
+      // ★v6.4: 測定の途中経過を復元(途中のページが無い/壊れている場合は枠を消してリセット)
+      const col = rec.collector;
+      if (col && col.collectingPageIdx >= 0 && pages[col.collectingPageIdx] && col.currentOrderIdx > 0) {
+        el("wheelOrder").value = col.orderIdx;
+        wheelValues = col.wheelValues || {};
+        currentOrderIdx = col.currentOrderIdx;
+        collectingPageIdx = col.collectingPageIdx;
+      } else {
+        pages.forEach(p => { if (p.nextWheel) { const w = p.nextWheel; p.nextWheel = null; redrawCell(p, w); } });
       }
       const restoreIdx = Math.min(Math.max(0, rec.currentPageIdx ?? 0), pages.length - 1);
       showPage(restoreIdx);
@@ -1005,6 +1098,7 @@ async function clearAllAndStartFresh() {
   pagesHost.innerHTML = "";
   pages = [];
   currentPageIdx = -1;
+  collectingPageIdx = -1;
   hasContent = false;
   createEmptyPage();
   showPage(0);
@@ -1524,6 +1618,7 @@ async function init() {
   console.log("[TPU-MINI handwriting] build:", BUILD_TAG);
 
   setupLayout();
+  resetWheelCollector(); // ★v6.4: 先に初期化しておき、loadStateで途中経過があれば上書き復元する
   await loadState();
 
   // ★PCではホイール操作でもページ送りできるようにしておく(タブレット実機は
@@ -1555,7 +1650,7 @@ async function init() {
   el("powerOffBtn").addEventListener("click", onPowerOffClick);
   updateCalMasterUnit(false);
   renderLiveInfo();
-  el("wheelOrder").addEventListener("change", resetWheelCollector);
+  el("wheelOrder").addEventListener("change", () => { resetWheelCollector(); saveState(); });
   el("unitToggleBtn").addEventListener("click", () => setDisplayUnit(displayUnit === "kPa" ? "bar" : "kPa"));
   el("prevBtn").addEventListener("click", goPrev);
   el("nextBtn").addEventListener("click", goNext);
@@ -1584,7 +1679,6 @@ async function init() {
     if (target) openCameraFor(target.page, target.wheel);
   });
 
-  resetWheelCollector();
 }
 
 init();
