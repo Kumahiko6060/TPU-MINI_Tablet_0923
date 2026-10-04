@@ -460,6 +460,13 @@
 //   測定を1ページ目から書き込むようにした。これまでは起動時・「新規」後の空のページを残して、
 //   1輪目の確定で新しいページ(2ページ目)を作っていた。最後のページにまだ測定値が無ければ、そこに書き込む。
 //   確認用の黒い欄は非表示にした(CSSの #dbgLog の display:none を外せば再表示できる)。
+//
+// ★v6.5での変更点(GAS連携):
+//   - 送信先を手書き専用のGAS(tpu_mini_handwriting_gas.gs)に変更。
+//   - 送信画像をJPEG(品質0.85)に変更。1,600万画素を超える時だけ全体を縮小する
+//     (iPadのブラウザは約1,677万画素を超えるCanvasを書き出せないため。20ページ超で縮小が始まる)。
+//   - 送るデータに pages(ページ数)と mimeType を追加。
+//   - GASの返事を読み、保存できた時だけ「送信完了」(ファイル名つき)と出す。失敗時は理由を出す。
 // =================================================================
 
 const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
@@ -478,9 +485,12 @@ const BAT_CRIT_PCT = 5;                            // 赤を閉じた後、も�
 const RECONNECT_INTERVAL_MS = 3000;   // 自動再接続を試みる間隔
 const CONNECT_TIMEOUT_MS = 8000;      // 1回の接続の試みの上限
 
-// ★通常モードと同じGAS Web Appをそのまま使う(手書き用のtype="handwriting"分岐は
-//   既存doPost()側にgas_handwriting_addon.gsの内容を追記してある前提)。
-const GAS_URL = "https://script.google.com/macros/s/AKfycbzVkPtrjLQHoI61LLRGcJu7mJ58D-VdpwrOCB4kXyT_W8gUPw28EHwf2Yksgl8IIH33/exec";
+// ★v6.5: 手書き専用のGAS(tpu_mini_handwriting_gas.gs)に送る。通常版のGASとは別。
+const GAS_URL = "https://script.google.com/macros/s/AKfycbxpn94e9MG9wbgAjJWwQ3ylfZS1Y06hugS-OzIanB1Wl13nVcJGGDGfqpeElkcuBX8/exec";
+// ★v6.5: 送信用の結合画像の上限(画素数)。iPadのブラウザはCanvasが約1,677万画素を超えると
+//   描けない/書き出せないため、余裕を見て1,600万画素に収まるよう、超える時だけ全体を縮小する。
+const COMBINED_MAX_PIXELS = 16000000;
+const COMBINED_JPEG_QUALITY = 0.85;   // 送信画像はJPEG(写真入りでもファイルが小さい)
 
 const WHEEL_ORDER_TABLE = [
   ["FL", "RL", "RR", "FR"],
@@ -493,7 +503,7 @@ const WHEEL_ORDER_TABLE = [
 // ★どのバージョンのファイルを開いているか実機側で見分けられるよう、画面に小さく表示する
 //   (「新しいファイルを送ったのに変化がない」という時、古いファイルを開いたままになっていないか
 //   確認しやすくするための目印。変更のたびにここを更新する)。
-const BUILD_TAG = "手書き v6.4.4 1ページ目から測定";
+const BUILD_TAG = "手書き v6.5 手書き専用GASへ送信";
 
 const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
 const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
@@ -1176,15 +1186,16 @@ function blobToBase64(blob) {
   });
 }
 
-// ★横一列の帯だとページ数が増えるほど際限なく横長になる(Canvasサイズ上限や
-//   PC側での確認しやすさの面で不利)ため、5列のグリッドに並べて結合する。
+// ★横一列の帯だとページ数が増えるほど際限なく横長になるため、5列のグリッドに並べて結合する。
+// ★v6.5: 画素数が COMBINED_MAX_PIXELS を超える時だけ全体を縮小し、JPEGで書き出す。
 async function buildCombinedBlob() {
   const n = pages.length;
   const cols = Math.min(COMBINED_COLS, n) || 1;
   const rows = Math.ceil(n / cols);
-  const exportDpr = 1; // 結合用Canvasはdpr=1固定で書き出す(PC確認用途なので解像度はこれで十分)
-  const cw = Math.round(PAGE_W_CSS * exportDpr);
-  const ch = Math.round(PAGE_H_CSS * exportDpr);
+  const fullW = PAGE_W_CSS * cols, fullH = PAGE_H_CSS * rows;
+  const scale = Math.min(1, Math.sqrt(COMBINED_MAX_PIXELS / (fullW * fullH)));
+  const cw = Math.floor(PAGE_W_CSS * scale);
+  const ch = Math.floor(PAGE_H_CSS * scale);
 
   const tmp = document.createElement("canvas");
   tmp.width = cw * cols;
@@ -1192,21 +1203,29 @@ async function buildCombinedBlob() {
   const tctx = tmp.getContext("2d");
   tctx.fillStyle = "#ffffff";
   tctx.fillRect(0, 0, tmp.width, tmp.height);
+  tctx.imageSmoothingEnabled = true;
+  tctx.imageSmoothingQuality = "high";
 
+  const labelPx = Math.max(12, Math.round(18 * scale));
   for (let i = 0; i < n; i++) {
     const col = i % cols, row = Math.floor(i / cols);
     const src = pages[i].canvas;
     const dx = col * cw, dy = row * ch;
     tctx.drawImage(src, 0, 0, src.width, src.height, dx, dy, cw, ch);
     tctx.save();
+    tctx.strokeStyle = "#cccccc";            // ページの区切り線
+    tctx.lineWidth = 1;
+    tctx.strokeRect(dx + 0.5, dy + 0.5, cw - 1, ch - 1);
     tctx.fillStyle = "rgba(0,0,0,0.55)";
-    tctx.font = "bold 14px sans-serif";
+    tctx.font = `bold ${labelPx}px sans-serif`;
     tctx.textAlign = "left";
     tctx.textBaseline = "top";
     tctx.fillText(`#${i + 1}`, dx + 6, dy + 6);
     tctx.restore();
   }
-  return new Promise(res => tmp.toBlob(res, "image/png"));
+  const blob = await new Promise(res => tmp.toBlob(res, "image/jpeg", COMBINED_JPEG_QUALITY));
+  if (!blob) throw new Error("画像の書き出しに失敗しました(画像が大きすぎる可能性があります)");
+  return { blob, width: tmp.width, height: tmp.height, scale };
 }
 
 // 成功したかどうかをbooleanで返す(「送信してから新規」の判断に使うため)
@@ -1218,22 +1237,32 @@ async function sendToGas() {
   }
   statusEl.textContent = "画像を書き出し中...";
   try {
-    const blob = await buildCombinedBlob();
-    const base64 = await blobToBase64(blob);
+    const img = await buildCombinedBlob();
+    const base64 = await blobToBase64(img.blob);
     const payload = {
       type: "handwriting",
       timestamp: new Date().toISOString(),
+      pages: pages.length,
+      mimeType: "image/jpeg",
       imageBase64: base64,
     };
-    statusEl.textContent = "送信中...";
+    const sizeMB = (img.blob.size / 1024 / 1024).toFixed(1);
+    statusEl.textContent = `送信中... (${pages.length}ページ / ${sizeMB}MB)`;
     const res = await fetch(GAS_URL, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify(payload),
     });
-    statusEl.textContent = `送信完了 (HTTP ${res.status}) ${new Date().toLocaleTimeString("ja-JP")}`;
-    console.log("[TPU-MINI handwriting] sent to GAS, status:", res.status);
-    return res.ok;
+    // ★v6.5: GASの返事(JSON)を見て、本当に保存できたかを表示する
+    let reply = null;
+    try { reply = JSON.parse(await res.text()); } catch (_) {}
+    const t = new Date().toLocaleTimeString("ja-JP");
+    if (res.ok && reply && reply.ok) {
+      statusEl.textContent = `送信完了 ${t}  ${reply.file} (${pages.length}ページ / ${sizeMB}MB${img.scale < 1 ? " / 縮小" : ""})`;
+      return true;
+    }
+    statusEl.textContent = `送信失敗 ${t}: ` + (reply && reply.error ? reply.error : `HTTP ${res.status}(GASの返事を読めませんでした)`);
+    return false;
   } catch (err) {
     statusEl.textContent = "送信失敗: " + err.message;
     console.error("[TPU-MINI handwriting] GAS send failed:", err);
