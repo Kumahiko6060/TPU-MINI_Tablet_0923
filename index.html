@@ -427,6 +427,11 @@
 //   - 田の字の下の時刻は4輪目の確定時刻(3輪目までは空欄)。
 //   - 測定の途中経過(測定順・確定済みの値・途中のページ)もIndexedDBに保存し、開き直しても続きから測れる。
 //   - 測定順を途中で変えたら、途中のページの枠を消して、次の確定から新しいページにする。
+//
+// ★v6.4.1での変更点:
+//   iPad(Bluefy)で、接続した瞬間から田の字に000.0が書き込まれ、ページが増え続ける不具合の修正。
+//   ライブ値の通知が確定値の処理にも届いていたため、各通知の e.target.uuid を確かめて、
+//   その特性自身の通知だけを処理するようにした(onNotify関数)。
 // =================================================================
 
 const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
@@ -447,7 +452,7 @@ const CONNECT_TIMEOUT_MS = 8000;      // 1回の接続の試みの上限
 
 // ★通常モードと同じGAS Web Appをそのまま使う(手書き用のtype="handwriting"分岐は
 //   既存doPost()側にgas_handwriting_addon.gsの内容を追記してある前提)。
-const GAS_URL = "https://script.google.com/macros/s/AKfycbxpn94e9MG9wbgAjJWwQ3ylfZS1Y06hugS-OzIanB1Wl13nVcJGGDGfqpeElkcuBX8/exec";
+const GAS_URL = "https://script.google.com/macros/s/AKfycbzVkPtrjLQHoI61LLRGcJu7mJ58D-VdpwrOCB4kXyT_W8gUPw28EHwf2Yksgl8IIH33/exec";
 
 const WHEEL_ORDER_TABLE = [
   ["FL", "RL", "RR", "FR"],
@@ -460,7 +465,7 @@ const WHEEL_ORDER_TABLE = [
 // ★どのバージョンのファイルを開いているか実機側で見分けられるよう、画面に小さく表示する
 //   (「新しいファイルを送ったのに変化がない」という時、古いファイルを開いたままになっていないか
 //   確認しやすくするための目印。変更のたびにここを更新する)。
-const BUILD_TAG = "手書き v6.4 1輪ずつ表示";
+const BUILD_TAG = "手書き v6.4.1 確定値のみ受付";
 
 const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
 const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
@@ -1450,10 +1455,18 @@ function showReconnecting() {
 //   代入に対応しておらず、ライブ値・MODEなどが届かなかったため)。再接続で同じcharacteristicの
 //   オブジェクトが返ってきても二重登録しないよう、登録済みのものはonNotify内で読み飛ばす。
 const notifyRegistered = new WeakSet();
-function onNotify(ch, handler) {
+// ★v6.4.1: 届いた通知が「どの特性からのものか」(e.target.uuid)を確かめ、登録した特性の通知だけ処理する。
+//   iPad(Bluefy)で、ライブ値(0.2秒ごとの"0.0")が確定値の処理にも届き、田の字に0.0が書き込まれて
+//   ページが増え続ける不具合があったため。uuidが取れない場合は従来どおり処理する。
+function onNotify(ch, uuid, handler) {
   if (notifyRegistered.has(ch)) return;   // 登録済み(再接続で同じオブジェクト)→何もしない
   notifyRegistered.add(ch);
-  ch.addEventListener("characteristicvaluechanged", handler);
+  const want = uuid.toLowerCase();
+  ch.addEventListener("characteristicvaluechanged", (e) => {
+    const got = e && e.target && e.target.uuid;
+    if (got && String(got).toLowerCase() !== want) return;   // 別の特性の通知 → 無視
+    handler(e);
+  });
 }
 
 async function connectGatt() {
@@ -1461,7 +1474,7 @@ async function connectGatt() {
   const service = await bleServer.getPrimaryService(SERVICE_UUID);
 
   const liveChar = await service.getCharacteristic(LIVE_CHAR_UUID);
-  onNotify(liveChar, (e) => {
+  onNotify(liveChar, LIVE_CHAR_UUID, (e) => {
     const v = parseFloat(textDecoder.decode(e.target.value));
     lastLiveKpa = Number.isNaN(v) ? null : v;
     renderLiveInfo();
@@ -1469,14 +1482,14 @@ async function connectGatt() {
   await liveChar.startNotifications();
 
   const confirmedChar = await service.getCharacteristic(CONFIRMED_CHAR_UUID);
-  onNotify(confirmedChar, (e) => {
+  onNotify(confirmedChar, CONFIRMED_CHAR_UUID, (e) => {
     const kpa = parseFloat(textDecoder.decode(e.target.value));
     if (!Number.isNaN(kpa)) onConfirmedValue(kpa);
   });
   await confirmedChar.startNotifications();
 
   const modeChar = await service.getCharacteristic(MODE_CHAR_UUID);
-  onNotify(modeChar, (e) => {
+  onNotify(modeChar, MODE_CHAR_UUID, (e) => {
     lastKnownModeChar = textDecoder.decode(e.target.value);
     renderLiveInfo();
   });
@@ -1488,7 +1501,7 @@ async function connectGatt() {
   // 本体電池(電池特性の無い古い送信機なら「--」のまま、他は従来どおり)
   try {
     const batChar = await service.getCharacteristic(BAT_CHAR_UUID);
-    onNotify(batChar, (e) => {
+    onNotify(batChar, BAT_CHAR_UUID, (e) => {
       const b = parseBattery(textDecoder.decode(e.target.value));
       renderBattery(b.pct, b.onCharger);
     });
@@ -1502,7 +1515,7 @@ async function connectGatt() {
   // 校正・電源OFF(取得できなければ設定内のボタンは押せないまま、他は従来どおり)
   try {
     const calStatChar = await service.getCharacteristic(CAL_STAT_CHAR_UUID);
-    onNotify(calStatChar, (e) => onCalStatus(textDecoder.decode(e.target.value)));
+    onNotify(calStatChar, CAL_STAT_CHAR_UUID, (e) => onCalStatus(textDecoder.decode(e.target.value)));
     await calStatChar.startNotifications();
     calCmdChar = await service.getCharacteristic(CAL_CMD_CHAR_UUID);
     onCalStatus(textDecoder.decode(await calStatChar.readValue()));
