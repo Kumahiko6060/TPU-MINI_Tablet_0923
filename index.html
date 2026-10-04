@@ -447,6 +447,13 @@
 //   iPad(Bluefy)で、接続した瞬間から田の字に000.0が書き込まれ、ページが増え続ける不具合の修正。
 //   ライブ値の通知が確定値の処理にも届いていたため、各通知の e.target.uuid を確かめて、
 //   その特性自身の通知だけを処理するようにした(onNotify関数)。
+//
+// ★v6.4.3での変更点:
+//   上記の本当の原因の修正。iPad(Bluefy)は接続の手続き中、各特性が今持っている値を何度も通知として
+//   届けてくる(確認用表示で、接続後約3秒の間にCONF/MODE/BAT/CALが2〜3回ずつ届くのを確認)。
+//   確定値の特性は最後に確定した値を持ち続けるため、それが田の字に書き込まれていた。
+//   接続の手続き中と、終わってから1.5秒間に届いた確定値は捨てる(CONF_IGNORE_AFTER_CONNECT_MS)。
+//   自動再接続でも同じ。確認用の黒い欄(v6.4.2)は確認のため残している。
 // =================================================================
 
 const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
@@ -480,7 +487,7 @@ const WHEEL_ORDER_TABLE = [
 // ★どのバージョンのファイルを開いているか実機側で見分けられるよう、画面に小さく表示する
 //   (「新しいファイルを送ったのに変化がない」という時、古いファイルを開いたままになっていないか
 //   確認しやすくするための目印。変更のたびにここを更新する)。
-const BUILD_TAG = "手書き v6.4.2 確認用表示つき";
+const BUILD_TAG = "手書き v6.4.3 接続直後の確定値を無視";
 
 const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
 const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
@@ -1515,7 +1522,14 @@ function onNotify(ch, uuid, handler) {
   });
 }
 
+// ★v6.4.3: iPad(Bluefy)は接続の手続き中(約3秒)、各特性が「今持っている値」を何度も通知として届ける。
+//   確定値の特性は最後に確定した値を持ち続けているため、それが新しい確定値として田の字に書き込まれていた。
+//   接続の手続きの間と、終わってから1.5秒間は確定値を捨てる(本物の確定はボタン後0.75秒以上かかるので実用上影響なし)。
+const CONF_IGNORE_AFTER_CONNECT_MS = 1500;
+let confIgnoreUntil = 0;
+
 async function connectGatt() {
+  confIgnoreUntil = Infinity;   // 手続きが終わるまでは捨てる
   dbgT0 = performance.now();
   dbg("接続開始");
   bleServer = await bleDevice.gatt.connect();
@@ -1531,6 +1545,11 @@ async function connectGatt() {
 
   const confirmedChar = await service.getCharacteristic(CONFIRMED_CHAR_UUID);
   onNotify(confirmedChar, CONFIRMED_CHAR_UUID, (e) => {
+    // ★v6.4.3: 接続の手続き中と、その後 CONF_IGNORE_AFTER_CONNECT_MS の間に届いた確定値は捨てる
+    if (performance.now() < confIgnoreUntil) {
+      dbg(`CONF 値=${textDecoder.decode(e.target.value)} → 接続直後のため無視`);
+      return;
+    }
     const kpa = parseFloat(textDecoder.decode(e.target.value));
     if (!Number.isNaN(kpa)) onConfirmedValue(kpa);
   });
@@ -1577,6 +1596,8 @@ async function connectGatt() {
 
   setConnected(true);
   updateCalButtons();
+  confIgnoreUntil = performance.now() + CONF_IGNORE_AFTER_CONNECT_MS;
+  dbg(`接続の手続き完了(確定値の受付は${CONF_IGNORE_AFTER_CONNECT_MS / 1000}秒後から)`);
 }
 
 function onGattDisconnected() {
