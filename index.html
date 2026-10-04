@@ -61,10 +61,82 @@
   }
   .status.connected { background: #163d24; color: #4ade80; }
   .status.disconnected { background: #3d1a1a; color: #f87171; }
+  .status.reconnecting { background: #4a3b0b; color: #facc15; }
+  /* ★v6.3: 状態表示・ボタンの文字が変わってもヘッダーの折り返し(=高さ)が変わらないよう幅を固定 */
+  #connectBtn { width: 124px; white-space: nowrap; }
+  #connStatus { display: inline-block; width: 78px; text-align: center; }
   #liveInfo {
     font-size: 12px;
     color: #aaa;
     white-space: nowrap;
+    display: inline-block;
+    width: 150px;
+  }
+  #batInfo {
+    font-size: 12px;
+    color: #aaa;
+    white-space: nowrap;
+    display: inline-block;
+    width: 82px;
+    font-variant-numeric: tabular-nums;
+  }
+  #batInfo.warn { color: #facc15; }
+  #batInfo.low  { color: #f87171; }
+  #batInfo.chg  { color: #22d3ee; }
+  #unitToggleBtn { width: 52px; }
+  /* 電池の催促帯: 書く領域の上に重ねる(差し込まないのでCanvasの大きさ・位置は変わらない) */
+  #batBanner {
+    position: absolute;
+    left: 0; right: 0; top: 0;
+    z-index: 50;
+    padding: 10px 16px;
+    font-size: 14px;
+    font-weight: 600;
+    display: none;
+    cursor: pointer;
+  }
+  #batBanner.warn { display: block; background: rgba(74, 59, 11, 0.95); color: #facc15; }
+  #batBanner.low  { display: block; background: rgba(74, 18, 18, 0.95); color: #f87171; }
+  #batBanner small { font-weight: normal; opacity: 0.8; margin-left: 8px; }
+  /* 設定ダイアログ(校正+電源OFF) */
+  .settings-box {
+    background: #1a1c22;
+    border: 1px solid #2a2d38;
+    border-radius: 12px;
+    padding: 16px 18px;
+    width: min(92vw, 460px);
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+  .settings-box h2 { font-size: 15px; margin: 0 0 10px; }
+  .settings-section {
+    border-top: 1px solid #2a2d38;
+    padding-top: 12px;
+    margin-top: 12px;
+  }
+  .cal-current { font-size: 13px; color: #ccc; margin-bottom: 8px; font-variant-numeric: tabular-nums; }
+  .cal-result {
+    font-size: 13px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: #23262f;
+    color: #ccc;
+    margin-bottom: 10px;
+  }
+  .cal-result.ok  { background: #163d24; color: #4ade80; }
+  .cal-result.err { background: #3d1a1a; color: #f87171; }
+  .cal-result.run { background: #0e3a44; color: #22d3ee; }
+  .cal-step { padding-top: 8px; margin-top: 8px; border-top: 1px dashed #2a2d38; }
+  .cal-hint { font-size: 12px; color: #888; margin-bottom: 6px; line-height: 1.5; }
+  .cal-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  input[type="number"] {
+    font-size: 14px;
+    padding: 7px 9px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    background: #111318;
+    color: #eee;
+    width: 110px;
   }
   #pageNav {
     display: flex;
@@ -84,6 +156,8 @@
     font-size: 11px;
     color: #888;
     padding: 4px 10px;
+    height: 22px; /* ★v6.3: 送信状況の文字が出ても高さが変わらないよう固定(Canvas下端の欠け防止) */
+    line-height: 14px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -174,6 +248,7 @@
   <button id="connectBtn" class="primary">接続</button>
   <span id="connStatus" class="status disconnected">未接続</span>
   <span id="liveInfo">--.- kPa / MODE: -</span>
+  <span id="batInfo">電池 --%</span>
   <select id="wheelOrder">
     <option value="0">FL始点</option>
     <option value="1">FR始点</option>
@@ -187,6 +262,7 @@
     <span id="pageIndicator">0/0</span>
     <button id="nextBtn">▶</button>
   </div>
+  <button id="settingsBtn">設定</button>
   <button id="newBtn" class="danger">新規</button>
   <button id="sendBtn" class="primary">送信</button>
 </div>
@@ -194,6 +270,7 @@
 
 <div id="canvasArea">
   <div id="pagesHost"></div>
+  <div id="batBanner"></div>
   <div id="emptyHint">BLE接続後、4輪分の測定が完了すると自動で1ページ目が作成されます</div>
 </div>
 
@@ -206,6 +283,45 @@
       <button id="modalSendThenNew" class="primary">送信してから新規</button>
       <button id="modalNewWithoutSend" class="danger">送信せず新規</button>
       <button id="modalCancel">キャンセル</button>
+    </div>
+  </div>
+</div>
+
+<div id="settingsModal" class="modal-overlay">
+  <div class="settings-box">
+    <h2>設定</h2>
+
+    <div class="settings-section" style="border-top:none;margin-top:0;padding-top:0;">
+      <div style="font-size:14px;margin-bottom:8px;">校正</div>
+      <div class="cal-current" id="calCurrent">ゼロ点 -- kPa / 倍率 --</div>
+      <div class="cal-result" id="calResult">未接続</div>
+
+      <div class="cal-step">
+        <div class="cal-hint">1. ゼロ点: チャックを何にもつながず、大気に開放した状態で押してください。</div>
+        <button id="calZeroBtn" disabled>ゼロ点を取る</button>
+      </div>
+
+      <div class="cal-step">
+        <div class="cal-hint">2. 倍率: 本体をMANUALにしてからタイヤにつなぎ、同じタイヤを基準器(Core2版など)で測った値を入れて押してください。終わったらチャックを外してください。</div>
+        <div class="cal-row">
+          <input type="number" id="calMaster" placeholder="基準値">
+          <span id="calMasterUnit" style="font-size:13px;color:#aaa;">kPa</span>
+          <button id="calGainBtn" disabled>倍率を合わせる</button>
+        </div>
+      </div>
+
+      <div class="cal-step">
+        <div class="cal-hint">校正値を初期値(ゼロ点0・倍率1)に戻します。</div>
+        <button id="calResetBtn" disabled>初期値に戻す</button>
+      </div>
+    </div>
+
+    <div class="settings-section">
+      <button id="powerOffBtn" class="danger" disabled style="width:100%;">本体の電源を切る</button>
+    </div>
+
+    <div class="settings-section">
+      <button id="settingsClose" class="primary" style="width:100%;">閉じる</button>
     </div>
   </div>
 </div>
@@ -278,12 +394,41 @@
 //   単位切替時は田の字部分(GRID_CLEAR_RECT)のみを再描画し、写真や手書きインクは
 //   一切変更しない。切替状態・各ページの測定値/タイムスタンプはIndexedDBにも
 //   保存し、次回起動時に復元される。
+//
+// ★v6.3での変更点(送信機側の電池通知・電源OFF・スリープ対応に追従。通常版 第6版と同じ仕組み):
+//   - 自動再接続: 本体側の事情(3分スリープ・電源OFF・圏外)で切れたら、ページを開いている間は
+//     3秒ごとに再接続を試みる(回数無制限)。自分で「切断」を押した時は試みない。画面ロックから
+//     戻った時もすぐ1回試みる。再接続中は状態欄が黄色「再接続中…」、接続ボタンは「再接続をやめる」。
+//     4輪の途中で切れても途中の値は消さない(特別な処理はしない)。
+//     通知の受け取りは oncharacteristicvaluechanged への代入にした(addEventListenerのままだと
+//     再接続のたびに処理が重複登録され、確定値が二重に届いてページが余分に作られるため)。
+//     ※ページを再読み込み/閉じた後は、Web Bluetoothの制限で「接続」から選び直しが必要。
+//   - 電池: BAT_CHAR("<残量%>;<充電台0/1>")を受け、ヘッダーに「電池 42%」(充電台では「充電中 42%」)。
+//     催促帯は書く領域の上に重ねる(差し込まない)。20%未満で黄、10%未満で赤(黄は25%、赤は15%まで
+//     戻ると消える)。充電台に置いている間は出さない。帯はタップで閉じられ、黄を閉じても赤になれば再表示、
+//     赤を閉じても5%未満になればもう一度だけ再表示する。
+//   - 設定ダイアログ(ヘッダー「設定」): 校正(ZERO / GAIN:<基準kPa> / RESET)と本体の電源OFF("OFF")。
+//     文言・確認ダイアログは通常版と同じ。基準値は表示単位(kPa/Bar)で入力し、送る直前にkPaへ換算。
+//   - ヘッダーのライブ値もkPa/Bar切替に合わせて表示する。
+//   - 状態表示・ボタン・送信状況欄の幅/高さを固定し、途中でヘッダーの高さが変わらないようにした
+//     (書く領域の大きさは起動時に決めているため、高さが変わるとページ下端が欠ける)。
 // =================================================================
 
 const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
 const LIVE_CHAR_UUID      = "12345678-1234-5678-1234-56789abcdef1";
 const CONFIRMED_CHAR_UUID = "12345678-1234-5678-1234-56789abcdef2";
 const MODE_CHAR_UUID      = "12345678-1234-5678-1234-56789abcdef3";
+const CAL_CMD_CHAR_UUID   = "12345678-1234-5678-1234-56789abcdef4";
+const CAL_STAT_CHAR_UUID  = "12345678-1234-5678-1234-56789abcdef5";
+const BAT_CHAR_UUID       = "12345678-1234-5678-1234-56789abcdef6";
+const CAL_MASTER_MIN = 50, CAL_MASTER_MAX = 551.6;   // kPa。送信機側の受付範囲と同じ
+
+const BAT_WARN_PCT = 20, BAT_WARN_CLEAR_PCT = 25;  // 黄色の帯
+const BAT_LOW_PCT  = 10, BAT_LOW_CLEAR_PCT  = 15;  // 赤い帯
+const BAT_CRIT_PCT = 5;                            // 赤を閉じた後、もう一度だけ出す残量
+
+const RECONNECT_INTERVAL_MS = 3000;   // 自動再接続を試みる間隔
+const CONNECT_TIMEOUT_MS = 8000;      // 1回の接続の試みの上限
 
 // ★通常モードと同じGAS Web Appをそのまま使う(手書き用のtype="handwriting"分岐は
 //   既存doPost()側にgas_handwriting_addon.gsの内容を追記してある前提)。
@@ -300,7 +445,7 @@ const WHEEL_ORDER_TABLE = [
 // ★どのバージョンのファイルを開いているか実機側で見分けられるよう、画面に小さく表示する
 //   (「新しいファイルを送ったのに変化がない」という時、古いファイルを開いたままになっていないか
 //   確認しやすくするための目印。変更のたびにここを更新する)。
-const BUILD_TAG = "v6.2 kPa/Bar切替+文字拡大";
+const BUILD_TAG = "手書き v6.3 再接続+電池+設定";
 
 const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
 const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
@@ -454,6 +599,8 @@ function setDisplayUnit(unit) {
   displayUnit = unit;
   el("unitToggleBtn").textContent = unit === "bar" ? "Bar" : "kPa";
   pages.forEach(redrawGridArea);
+  renderLiveInfo();
+  updateCalMasterUnit(true);
   saveState();
 }
 
@@ -815,6 +962,8 @@ async function loadState() {
       if (rec.displayUnit) {
         displayUnit = rec.displayUnit;
         el("unitToggleBtn").textContent = displayUnit === "bar" ? "Bar" : "kPa";
+        renderLiveInfo();
+        updateCalMasterUnit(true);
       }
       return;
     }
@@ -949,8 +1098,229 @@ async function sendToGas() {
 }
 
 // -----------------------------------------------------------------
-// BLE接続(通常モードと同じ接続処理)
+// ライブ値表示(★v6.3: kPa/Bar切替に合わせる)
 // -----------------------------------------------------------------
+let lastLiveKpa = null;   // 最後に受け取ったライブ値(kPa)。未接続/不明ならnull
+
+function renderLiveInfo() {
+  const modeStr = (bleDevice && bleDevice.gatt.connected)
+    ? (lastKnownModeChar === "A" ? "AUTO" : "MANUAL") : "-";
+  const unitLabel = displayUnit === "bar" ? "Bar" : "kPa";
+  el("liveInfo").textContent = `${formatPressure(lastLiveKpa, displayUnit)} ${unitLabel} / MODE: ${modeStr}`;
+}
+
+// -----------------------------------------------------------------
+// 本体電池(★v6.3。基準は通常版 第6版と同じ)
+//   stage: 0=なし / 1=黄 / 2=赤 / 3=赤かつ5%未満
+//   dismissedStage: 帯をタップで閉じた時点のstage。stageがそれを上回った時だけ再表示する。
+//   ※未接続(スリープ等)の間は帯を隠すだけで dismissedStage は消さない
+//     (3分スリープ→再接続のたびに、閉じた帯がまた出てくるのを防ぐため)。
+// -----------------------------------------------------------------
+let batBannerLevel = 0;   // 0/1/2(通常版と同じずれ幅付きの判定)
+let batStage = 0;
+let batDismissedStage = 0;
+let batKnown = false;
+
+function batteryStage(pct) {
+  if (batBannerLevel === 2) return pct < BAT_CRIT_PCT ? 3 : 2;
+  return batBannerLevel;
+}
+
+function renderBattery(pct, onCharger) {
+  const info = el("batInfo");
+  if (pct == null || pct < 0) {
+    batKnown = false;
+    info.textContent = "電池 --%";
+    info.className = "";
+  } else {
+    batKnown = true;
+    const p = Math.max(0, Math.min(100, pct));
+    if (onCharger) {
+      batBannerLevel = 0;                       // 充電台に置いたら催促しない
+    } else if (p < BAT_LOW_PCT) {
+      batBannerLevel = 2;
+    } else if (batBannerLevel === 2 && p < BAT_LOW_CLEAR_PCT) {
+      // 赤のまま
+    } else if (p < BAT_WARN_PCT) {
+      batBannerLevel = 1;
+    } else if (batBannerLevel >= 1 && p < BAT_WARN_CLEAR_PCT) {
+      batBannerLevel = 1;                       // 黄のまま
+    } else {
+      batBannerLevel = 0;
+    }
+    batStage = batteryStage(p);
+    // 回復した分は「閉じた」記録も下げる(再び悪化した時にまた出せるように)
+    batDismissedStage = Math.min(batDismissedStage, batStage);
+
+    info.textContent = onCharger ? `充電中 ${p}%` : `電池 ${p}%`;
+    info.className = onCharger ? "chg" : (batBannerLevel === 2 ? "low" : (batBannerLevel === 1 ? "warn" : ""));
+  }
+  renderBatBanner();
+}
+
+function renderBatBanner() {
+  const banner = el("batBanner");
+  const show = batKnown && batStage > 0 && batStage > batDismissedStage;
+  if (!show) {
+    banner.className = "";
+    banner.innerHTML = "";
+    return;
+  }
+  let msg;
+  if (batStage === 3)      msg = "本体を充電してください(残り5%未満)";
+  else if (batStage === 2) msg = "本体を充電してください";
+  else                     msg = "本体の残量が少なくなっています";
+  banner.className = batStage >= 2 ? "low" : "warn";
+  banner.innerHTML = `${msg}<small>タップで閉じる</small>`;
+}
+
+// "42;0" → {pct:42, onCharger:false}
+function parseBattery(text) {
+  const [a, b] = text.split(";");
+  const pct = parseInt(a, 10);
+  return { pct: Number.isNaN(pct) ? null : pct, onCharger: b === "1" };
+}
+
+// -----------------------------------------------------------------
+// 校正・電源OFF(★v6.3。設定ダイアログ内。文言は通常版 第6版と同じ)
+// -----------------------------------------------------------------
+let calCmdChar = null;
+let calRunning = false;
+
+const CAL_MESSAGES = {
+  "READY":       ["待機中", ""],
+  "RUN:ZERO":    ["ゼロ点を測定中…", "run"],
+  "RUN:GAIN":    ["倍率を測定中…", "run"],
+  "OK:ZERO":     ["ゼロ点を保存しました", "ok"],
+  "OK:GAIN":     ["倍率を保存しました。チャックを外してください", "ok"],
+  "OK:RESET":    ["初期値に戻しました", "ok"],
+  "BUSY":        ["測定中または校正中のため受け付けられませんでした。少し待ってからやり直してください", "err"],
+  "ERR:CMD":     ["送信機がコマンドを理解できませんでした", "err"],
+  "ERR:MASTER":  ["基準値が範囲外です(50〜551kPa)", "err"],
+  "ERR:TIMEOUT": ["測定値が十分に集まりませんでした。ADCの接続を確認してください", "err"],
+  "ERR:ZERO":    ["圧力がかかっています。チャックを外し、大気開放でやり直してください", "err"],
+  "ERR:DENOM":   ["圧力が低すぎます。タイヤにつないだ状態でやり直してください", "err"],
+  "ERR:GAIN":    ["補正量が大きすぎます(±20%超)。基準値とつなぎ方を確認してください", "err"],
+  "ERR:SAVE":    ["本体への保存に失敗しました", "err"],
+  "OK:OFF":      ["本体の電源を切りました", "ok"],
+  "ERR:CHARGER": ["充電台に置いている間は電源を切れません", "err"],
+};
+
+// 基準値の入力範囲(表示単位ごと)。送信機へは常にkPaで送る。
+function calMasterRange() {
+  return displayUnit === "bar"
+    ? { min: CAL_MASTER_MIN / 100, max: CAL_MASTER_MAX / 100, step: 0.01, digits: 2, label: "Bar" }
+    : { min: CAL_MASTER_MIN,       max: CAL_MASTER_MAX,       step: 0.1,  digits: 1, label: "kPa" };
+}
+
+// 単位切替時: 入力欄の単位表示・範囲を合わせる。入力途中の値は意味が変わるので消す。
+function updateCalMasterUnit(clearValue) {
+  const r = calMasterRange();
+  const input = el("calMaster");
+  input.min = r.min; input.max = r.max; input.step = r.step;
+  el("calMasterUnit").textContent = r.label;
+  if (clearValue) input.value = "";
+}
+
+function updateCalButtons() {
+  const ok = !!calCmdChar && !!bleDevice && bleDevice.gatt.connected && !calRunning;
+  el("calZeroBtn").disabled = !ok;
+  el("calGainBtn").disabled = !ok;
+  el("calResetBtn").disabled = !ok;
+  el("powerOffBtn").disabled = !ok;
+}
+
+function showCalResult(text, cls) {
+  const r = el("calResult");
+  r.textContent = text;
+  r.className = "cal-result" + (cls ? " " + cls : "");
+}
+
+// "OK:ZERO;Z=0.12;G=1.0234" を表示に反映
+function onCalStatus(text) {
+  const parts = text.split(";");
+  const result = parts[0];
+  let z = null, g = null;
+  parts.slice(1).forEach(p => {
+    if (p.startsWith("Z=")) z = parseFloat(p.slice(2));
+    if (p.startsWith("G=")) g = parseFloat(p.slice(2));
+  });
+  if (z != null && g != null && !Number.isNaN(z) && !Number.isNaN(g)) {
+    el("calCurrent").textContent = `ゼロ点 ${z.toFixed(2)} kPa / 倍率 ${g.toFixed(4)}`;
+  }
+  const m = CAL_MESSAGES[result] || [result, ""];
+  showCalResult(m[0], m[1]);
+  if (result === "ERR:CHARGER") {
+    alert("充電台に置いている間は、本体の電源を切れません。\n充電台から外してからやり直してください。");
+  }
+  calRunning = result.startsWith("RUN:");
+  updateCalButtons();
+}
+
+async function sendCalCommand(cmd) {
+  if (!calCmdChar) return;
+  try {
+    const data = new TextEncoder().encode(cmd);
+    if (calCmdChar.writeValueWithResponse) await calCmdChar.writeValueWithResponse(data);
+    else await calCmdChar.writeValue(data);
+  } catch (err) {
+    showCalResult("送信に失敗しました: " + err.message, "err");
+  }
+}
+
+function resetCalUi() {
+  calCmdChar = null;
+  calRunning = false;
+  el("calCurrent").textContent = "ゼロ点 -- kPa / 倍率 --";
+  showCalResult("未接続", "");
+  updateCalButtons();
+}
+
+function onCalZeroClick() {
+  if (!confirm("チャックを何にもつながず、大気開放の状態ですか？\nこの状態を0kPaとして保存します。")) return;
+  sendCalCommand("ZERO");
+}
+
+function onCalGainClick() {
+  if (lastKnownModeChar === "A") {
+    alert("本体がAUTOモードです。\nタイヤにつないだ瞬間に確定値が送られてしまうため、MANUALに切り替えてから行ってください。");
+    return;
+  }
+  const r = calMasterRange();
+  const v = parseFloat(el("calMaster").value);
+  if (Number.isNaN(v) || v < r.min || v > r.max) {
+    const f = Math.pow(10, r.digits);   // 上限は切り捨てで表示(5.516Bar→「5.51」。四捨五入だと受け付けない値が出るため)
+    alert(`基準値を${r.min.toFixed(r.digits)}〜${(Math.floor(r.max * f) / f).toFixed(r.digits)} ${r.label}の範囲で入力してください。`);
+    return;
+  }
+  const kpa = displayUnit === "bar" ? v * 100 : v;   // 送信機へは常にkPaで送る
+  const shown = displayUnit === "bar"
+    ? `${v.toFixed(2)} Bar(${kpa.toFixed(1)} kPa)` : `${kpa.toFixed(1)} kPa`;
+  if (!confirm(`タイヤにつないだ状態ですか？\n本機の値が基準値 ${shown} に合うように倍率を保存します。`)) return;
+  sendCalCommand("GAIN:" + kpa.toFixed(1));
+}
+
+function onCalResetClick() {
+  if (!confirm("校正値を初期値(ゼロ点0・倍率1)に戻しますか？")) return;
+  sendCalCommand("RESET");
+}
+
+function onPowerOffClick() {
+  if (!confirm("本体の電源を切りますか？\n次に使う時は、USB-C(充電台)につなぐと起動します。")) return;
+  sendCalCommand("OFF");
+}
+
+function openSettings()  { el("settingsModal").style.display = "flex"; }
+function closeSettings() { el("settingsModal").style.display = "none"; }
+
+// -----------------------------------------------------------------
+// BLE接続+自動再接続(★v6.3: 通常版 第6版と同じ仕組み)
+// -----------------------------------------------------------------
+let userDisconnect = false;   // 自分で「切断」を押したか(押した時は自動再接続しない)
+let reconnecting = false;
+let reconnectTimer = null;
+let attemptInFlight = false;
+
 function setConnected(connected) {
   const statusEl = el("connStatus");
   if (connected) {
@@ -961,9 +1331,128 @@ function setConnected(connected) {
     statusEl.textContent = "未接続";
     statusEl.className = "status disconnected";
     el("connectBtn").textContent = "接続";
-    el("liveInfo").textContent = "--.- kPa / MODE: -";
+    lastLiveKpa = null;
+    renderBattery(null, false);   // 未接続の間は「--」にして帯も隠す(閉じた記録は残す)
+    resetCalUi();
+  }
+  renderLiveInfo();
+}
+
+function showReconnecting() {
+  const statusEl = el("connStatus");
+  statusEl.textContent = "再接続中…";
+  statusEl.className = "status reconnecting";
+  el("connectBtn").textContent = "再接続をやめる";
+}
+
+// GATTに接続して、全characteristicの通知を受け直す(初回接続・再接続で共通)
+// ★通知は oncharacteristicvaluechanged への代入で受ける(再接続で二重登録されないように)
+async function connectGatt() {
+  bleServer = await bleDevice.gatt.connect();
+  const service = await bleServer.getPrimaryService(SERVICE_UUID);
+
+  const liveChar = await service.getCharacteristic(LIVE_CHAR_UUID);
+  liveChar.oncharacteristicvaluechanged = (e) => {
+    const v = parseFloat(textDecoder.decode(e.target.value));
+    lastLiveKpa = Number.isNaN(v) ? null : v;
+    renderLiveInfo();
+  };
+  await liveChar.startNotifications();
+
+  const confirmedChar = await service.getCharacteristic(CONFIRMED_CHAR_UUID);
+  confirmedChar.oncharacteristicvaluechanged = (e) => {
+    const kpa = parseFloat(textDecoder.decode(e.target.value));
+    if (!Number.isNaN(kpa)) onConfirmedValue(kpa);
+  };
+  await confirmedChar.startNotifications();
+
+  const modeChar = await service.getCharacteristic(MODE_CHAR_UUID);
+  modeChar.oncharacteristicvaluechanged = (e) => {
+    lastKnownModeChar = textDecoder.decode(e.target.value);
+    renderLiveInfo();
+  };
+  await modeChar.startNotifications();
+  try {
+    lastKnownModeChar = textDecoder.decode(await modeChar.readValue());
+  } catch (_) { /* 読めなくても致命的ではない */ }
+
+  // 本体電池(電池特性の無い古い送信機なら「--」のまま、他は従来どおり)
+  try {
+    const batChar = await service.getCharacteristic(BAT_CHAR_UUID);
+    batChar.oncharacteristicvaluechanged = (e) => {
+      const b = parseBattery(textDecoder.decode(e.target.value));
+      renderBattery(b.pct, b.onCharger);
+    };
+    await batChar.startNotifications();
+    const b = parseBattery(textDecoder.decode(await batChar.readValue()));
+    renderBattery(b.pct, b.onCharger);
+  } catch (err) {
+    console.log("[TPU-MINI handwriting] battery characteristic not available:", err.message);
+  }
+
+  // 校正・電源OFF(取得できなければ設定内のボタンは押せないまま、他は従来どおり)
+  try {
+    const calStatChar = await service.getCharacteristic(CAL_STAT_CHAR_UUID);
+    calStatChar.oncharacteristicvaluechanged = (e) => onCalStatus(textDecoder.decode(e.target.value));
+    await calStatChar.startNotifications();
+    calCmdChar = await service.getCharacteristic(CAL_CMD_CHAR_UUID);
+    onCalStatus(textDecoder.decode(await calStatChar.readValue()));
+  } catch (err) {
+    calCmdChar = null;
+    showCalResult("この送信機は校正に対応していません", "err");
+    console.log("[TPU-MINI handwriting] calibration characteristics not available:", err.message);
+  }
+
+  setConnected(true);
+  updateCalButtons();
+}
+
+function onGattDisconnected() {
+  setConnected(false);
+  if (!userDisconnect && bleDevice) startReconnect();   // 本体側の事情で切れた時だけ
+}
+
+function startReconnect() {
+  if (reconnecting) return;
+  reconnecting = true;
+  showReconnecting();
+  console.log("[TPU-MINI handwriting] start auto reconnect");
+  reconnectTimer = setInterval(tryReconnect, RECONNECT_INTERVAL_MS);
+  tryReconnect();
+}
+
+function stopReconnect() {
+  reconnecting = false;
+  if (reconnectTimer) clearInterval(reconnectTimer);
+  reconnectTimer = null;
+}
+
+async function tryReconnect() {
+  if (!reconnecting || attemptInFlight || !bleDevice) return;
+  if (bleDevice.gatt.connected) { stopReconnect(); return; }
+  attemptInFlight = true;
+  try {
+    await Promise.race([
+      connectGatt(),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), CONNECT_TIMEOUT_MS)),
+    ]);
+    stopReconnect();
+    console.log("[TPU-MINI handwriting] reconnected");
+  } catch (err) {
+    // 見つからない・時間切れ → 次の周期でまた試す
+    if (bleDevice && bleDevice.gatt.connected === false) {
+      try { bleDevice.gatt.disconnect(); } catch (_) {}   // 待ち続けている接続を取り消す
+    }
+    if (reconnecting) showReconnecting();   // 途中で setConnected(false) に戻された表示を直す
+  } finally {
+    attemptInFlight = false;
   }
 }
+
+// 画面ロックから戻った時は、すぐに1回試みる
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && reconnecting) tryReconnect();
+});
 
 async function connect() {
   if (!navigator.bluetooth) {
@@ -971,42 +1460,16 @@ async function connect() {
     return;
   }
   try {
-    bleDevice = await navigator.bluetooth.requestDevice({
+    const device = await navigator.bluetooth.requestDevice({
       filters: [{ services: [SERVICE_UUID] }],
     });
-    bleDevice.addEventListener("gattserverdisconnected", () => setConnected(false));
-
-    bleServer = await bleDevice.gatt.connect();
-    const service = await bleServer.getPrimaryService(SERVICE_UUID);
-
-    const liveChar = await service.getCharacteristic(LIVE_CHAR_UUID);
-    await liveChar.startNotifications();
-    let lastLiveText = "--.-";
-    liveChar.addEventListener("characteristicvaluechanged", (e) => {
-      lastLiveText = textDecoder.decode(e.target.value);
-      el("liveInfo").textContent = `${lastLiveText} kPa / MODE: ${lastKnownModeChar === "A" ? "AUTO" : "MANUAL"}`;
-    });
-
-    const confirmedChar = await service.getCharacteristic(CONFIRMED_CHAR_UUID);
-    await confirmedChar.startNotifications();
-    confirmedChar.addEventListener("characteristicvaluechanged", (e) => {
-      const text = textDecoder.decode(e.target.value);
-      const kpa = parseFloat(text);
-      if (!Number.isNaN(kpa)) onConfirmedValue(kpa);
-    });
-
-    const modeChar = await service.getCharacteristic(MODE_CHAR_UUID);
-    await modeChar.startNotifications();
-    modeChar.addEventListener("characteristicvaluechanged", (e) => {
-      lastKnownModeChar = textDecoder.decode(e.target.value);
-      el("liveInfo").textContent = `${lastLiveText} kPa / MODE: ${lastKnownModeChar === "A" ? "AUTO" : "MANUAL"}`;
-    });
-    try {
-      const initial = await modeChar.readValue();
-      lastKnownModeChar = textDecoder.decode(initial);
-    } catch (_) { /* 読めなくても致命的ではない */ }
-
-    setConnected(true);
+    if (bleDevice !== device) {
+      if (bleDevice) bleDevice.removeEventListener("gattserverdisconnected", onGattDisconnected);
+      bleDevice = device;
+      bleDevice.addEventListener("gattserverdisconnected", onGattDisconnected);
+    }
+    userDisconnect = false;
+    await connectGatt();
   } catch (err) {
     console.error(err);
     if (err.name !== "NotFoundError") {
@@ -1016,10 +1479,26 @@ async function connect() {
 }
 
 function disconnect() {
+  userDisconnect = true;
+  stopReconnect();
   if (bleDevice && bleDevice.gatt.connected) {
     bleDevice.gatt.disconnect();
   }
   setConnected(false);
+}
+
+function onConnectBtnClick() {
+  if (reconnecting) {
+    // 再接続をやめる
+    userDisconnect = true;
+    stopReconnect();
+    try { if (bleDevice) bleDevice.gatt.disconnect(); } catch (_) {}
+    setConnected(false);
+  } else if (bleDevice && bleDevice.gatt.connected) {
+    disconnect();
+  } else {
+    connect();
+  }
 }
 
 // -----------------------------------------------------------------
@@ -1046,10 +1525,21 @@ async function init() {
     setTimeout(() => { wheelCooldown = false; }, 350);
   }, { passive: false });
 
-  el("connectBtn").addEventListener("click", () => {
-    if (bleDevice && bleDevice.gatt.connected) disconnect();
-    else connect();
+  el("connectBtn").addEventListener("click", onConnectBtnClick);
+
+  // ★v6.3: 電池の催促帯(タップで閉じる)・設定ダイアログ
+  el("batBanner").addEventListener("click", () => {
+    batDismissedStage = batStage;
+    renderBatBanner();
   });
+  el("settingsBtn").addEventListener("click", openSettings);
+  el("settingsClose").addEventListener("click", closeSettings);
+  el("calZeroBtn").addEventListener("click", onCalZeroClick);
+  el("calGainBtn").addEventListener("click", onCalGainClick);
+  el("calResetBtn").addEventListener("click", onCalResetClick);
+  el("powerOffBtn").addEventListener("click", onPowerOffClick);
+  updateCalMasterUnit(false);
+  renderLiveInfo();
   el("wheelOrder").addEventListener("change", resetWheelCollector);
   el("unitToggleBtn").addEventListener("click", () => setDisplayUnit(displayUnit === "kPa" ? "bar" : "kPa"));
   el("prevBtn").addEventListener("click", goPrev);
