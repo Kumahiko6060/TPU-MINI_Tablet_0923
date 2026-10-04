@@ -400,8 +400,8 @@
 //     3秒ごとに再接続を試みる(回数無制限)。自分で「切断」を押した時は試みない。画面ロックから
 //     戻った時もすぐ1回試みる。再接続中は状態欄が黄色「再接続中…」、接続ボタンは「再接続をやめる」。
 //     4輪の途中で切れても途中の値は消さない(特別な処理はしない)。
-//     通知の受け取りは oncharacteristicvaluechanged への代入にした(addEventListenerのままだと
-//     再接続のたびに処理が重複登録され、確定値が二重に届いてページが余分に作られるため)。
+//     通知の受け取りは、再接続のたびに処理が重複登録されないようにしている
+//     (重複すると確定値が二重に届いてページが余分に作られるため)。方法はv6.3.1参照。
 //     ※ページを再読み込み/閉じた後は、Web Bluetoothの制限で「接続」から選び直しが必要。
 //   - 電池: BAT_CHAR("<残量%>;<充電台0/1>")を受け、ヘッダーに「電池 42%」(充電台では「充電中 42%」)。
 //     催促帯は書く領域の上に重ねる(差し込まない)。20%未満で黄、10%未満で赤(黄は25%、赤は15%まで
@@ -412,6 +412,12 @@
 //   - ヘッダーのライブ値もkPa/Bar切替に合わせて表示する。
 //   - 状態表示・ボタン・送信状況欄の幅/高さを固定し、途中でヘッダーの高さが変わらないようにした
 //     (書く領域の大きさは起動時に決めているため、高さが変わるとページ下端が欠ける)。
+//
+// ★v6.3.1での変更点:
+//   iPad(Bluefy)で、接続はできるのにライブ値・MODEの通知が届かない不具合の修正。
+//   v6.3では通知を oncharacteristicvaluechanged への代入で受けていたが、Bluefyはこれに
+//   対応していないとみられるため、addEventListener に戻した。再接続時の二重登録は、
+//   登録済みのcharacteristicを覚えておく(WeakSet)ことで防ぐ(onNotify関数)。
 // =================================================================
 
 const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
@@ -445,7 +451,7 @@ const WHEEL_ORDER_TABLE = [
 // ★どのバージョンのファイルを開いているか実機側で見分けられるよう、画面に小さく表示する
 //   (「新しいファイルを送ったのに変化がない」という時、古いファイルを開いたままになっていないか
 //   確認しやすくするための目印。変更のたびにここを更新する)。
-const BUILD_TAG = "手書き v6.3 再接続+電池+設定";
+const BUILD_TAG = "手書き v6.3.1 Bluefy通知対応";
 
 const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
 const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
@@ -1346,31 +1352,40 @@ function showReconnecting() {
 }
 
 // GATTに接続して、全characteristicの通知を受け直す(初回接続・再接続で共通)
-// ★通知は oncharacteristicvaluechanged への代入で受ける(再接続で二重登録されないように)
+// ★v6.3.1: 通知は addEventListener で受ける(iPadのBluefyは oncharacteristicvaluechanged への
+//   代入に対応しておらず、ライブ値・MODEなどが届かなかったため)。再接続で同じcharacteristicの
+//   オブジェクトが返ってきても二重登録しないよう、登録済みのものはonNotify内で読み飛ばす。
+const notifyRegistered = new WeakSet();
+function onNotify(ch, handler) {
+  if (notifyRegistered.has(ch)) return;   // 登録済み(再接続で同じオブジェクト)→何もしない
+  notifyRegistered.add(ch);
+  ch.addEventListener("characteristicvaluechanged", handler);
+}
+
 async function connectGatt() {
   bleServer = await bleDevice.gatt.connect();
   const service = await bleServer.getPrimaryService(SERVICE_UUID);
 
   const liveChar = await service.getCharacteristic(LIVE_CHAR_UUID);
-  liveChar.oncharacteristicvaluechanged = (e) => {
+  onNotify(liveChar, (e) => {
     const v = parseFloat(textDecoder.decode(e.target.value));
     lastLiveKpa = Number.isNaN(v) ? null : v;
     renderLiveInfo();
-  };
+  });
   await liveChar.startNotifications();
 
   const confirmedChar = await service.getCharacteristic(CONFIRMED_CHAR_UUID);
-  confirmedChar.oncharacteristicvaluechanged = (e) => {
+  onNotify(confirmedChar, (e) => {
     const kpa = parseFloat(textDecoder.decode(e.target.value));
     if (!Number.isNaN(kpa)) onConfirmedValue(kpa);
-  };
+  });
   await confirmedChar.startNotifications();
 
   const modeChar = await service.getCharacteristic(MODE_CHAR_UUID);
-  modeChar.oncharacteristicvaluechanged = (e) => {
+  onNotify(modeChar, (e) => {
     lastKnownModeChar = textDecoder.decode(e.target.value);
     renderLiveInfo();
-  };
+  });
   await modeChar.startNotifications();
   try {
     lastKnownModeChar = textDecoder.decode(await modeChar.readValue());
@@ -1379,10 +1394,10 @@ async function connectGatt() {
   // 本体電池(電池特性の無い古い送信機なら「--」のまま、他は従来どおり)
   try {
     const batChar = await service.getCharacteristic(BAT_CHAR_UUID);
-    batChar.oncharacteristicvaluechanged = (e) => {
+    onNotify(batChar, (e) => {
       const b = parseBattery(textDecoder.decode(e.target.value));
       renderBattery(b.pct, b.onCharger);
-    };
+    });
     await batChar.startNotifications();
     const b = parseBattery(textDecoder.decode(await batChar.readValue()));
     renderBattery(b.pct, b.onCharger);
@@ -1393,7 +1408,7 @@ async function connectGatt() {
   // 校正・電源OFF(取得できなければ設定内のボタンは押せないまま、他は従来どおり)
   try {
     const calStatChar = await service.getCharacteristic(CAL_STAT_CHAR_UUID);
-    calStatChar.oncharacteristicvaluechanged = (e) => onCalStatus(textDecoder.decode(e.target.value));
+    onNotify(calStatChar, (e) => onCalStatus(textDecoder.decode(e.target.value)));
     await calStatChar.startNotifications();
     calCmdChar = await service.getCharacteristic(CAL_CMD_CHAR_UUID);
     onCalStatus(textDecoder.decode(await calStatChar.readValue()));
