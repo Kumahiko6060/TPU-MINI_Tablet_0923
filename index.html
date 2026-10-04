@@ -85,6 +85,17 @@
   #batInfo.chg  { color: #22d3ee; }
   #unitToggleBtn { width: 52px; }
   /* 電池の催促帯: 書く領域の上に重ねる(差し込まないのでCanvasの大きさ・位置は変わらない) */
+  /* ★v6.6: 元の写真を保存するボタン(撮影後に右下へ出す) */
+  #origSaveBar {
+    position: absolute;
+    right: 12px; bottom: 12px;
+    z-index: 55;
+    display: none;
+    gap: 6px;
+  }
+  #origSaveBar.show { display: flex; }
+  #origSaveBar button { box-shadow: 0 2px 8px rgba(0,0,0,0.4); }
+  #origSaveBtn { background: #15803d; border-color: #15803d; font-size: 15px; padding: 12px 16px; }
   #batBanner {
     position: absolute;
     left: 0; right: 0; top: 0;
@@ -286,6 +297,10 @@
 <div id="canvasArea">
   <div id="pagesHost"></div>
   <div id="batBanner"></div>
+  <div id="origSaveBar">
+    <button id="origSaveBtn">元の写真を保存</button>
+    <button id="origSaveDismiss" title="保存しない">✕</button>
+  </div>
   <div id="dbgLog">確認用: 届いた通知をここに表示します</div>
   <div id="emptyHint">BLE接続後、1輪目が確定すると自動でページが作成されます</div>
 </div>
@@ -338,6 +353,18 @@
 
     <div class="settings-section">
       <button id="settingsClose" class="primary" style="width:100%;">閉じる</button>
+    </div>
+  </div>
+</div>
+
+<div id="origViewModal" class="modal-overlay">
+  <div class="photo-view-box">
+    <p style="margin:0 0 10px;font-size:14px;line-height:1.6;">この端末では共有画面を開けませんでした。<br>
+      写真を<b>長押し</b>して「"写真"に保存」を選んでください。</p>
+    <img id="origViewImg" alt="元の写真">
+    <div class="photo-view-actions">
+      <button id="origViewNext" class="primary">次の写真</button>
+      <button id="origViewClose">閉じる</button>
     </div>
   </div>
 </div>
@@ -467,6 +494,12 @@
 //     (iPadのブラウザは約1,677万画素を超えるCanvasを書き出せないため。20ページ超で縮小が始まる)。
 //   - 送るデータに pages(ページ数)と mimeType を追加。
 //   - GASの返事を読み、保存できた時だけ「送信完了」(ファイル名つき)と出す。失敗時は理由を出す。
+//
+// ★v6.6での変更点(元の写真の保存):
+//   撮影して「写真を使用」を押すと、ページに縮小して貼るのに加えて、元の写真を保存待ちにし、
+//   右下に「元の写真を保存」ボタンを出す。タップすると共有画面が開くので「画像を保存」を選ぶ
+//   (複数枚たまっていれば一度に保存できる)。共有画面を開けない時は1枚ずつ表示して長押しで保存。
+//   ファイル名は TPU_P<ページ>_<輪>_<日時>.jpg。✕で保存せず破棄。保存待ちはアプリを閉じると消える。
 // =================================================================
 
 const SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0";
@@ -503,7 +536,7 @@ const WHEEL_ORDER_TABLE = [
 // ★どのバージョンのファイルを開いているか実機側で見分けられるよう、画面に小さく表示する
 //   (「新しいファイルを送ったのに変化がない」という時、古いファイルを開いたままになっていないか
 //   確認しやすくするための目印。変更のたびにここを更新する)。
-const BUILD_TAG = "手書き v6.5 手書き専用GASへ送信";
+const BUILD_TAG = "手書き v6.6 元の写真を保存";
 
 const MAX_PAGES = 50;   // ★1ページ=1回の測定。1セッション最大20〜30回の想定に余裕を持たせた上限(旧MAX_BLOCKSを踏襲)
 const COMBINED_COLS = 5; // ★送信用結合画像のグリッド列数
@@ -1032,11 +1065,88 @@ el("photoInput").addEventListener("change", async (e) => {
     await drawPhotoIntoPage(target.page, target.wheel, file);
     hasContent = true;
     saveState();
+    queueOriginalPhoto(file, target.page, target.wheel);   // ★v6.6: 元の写真を保存待ちに入れる
   } catch (err) {
     console.error("[TPU-MINI handwriting] photo draw failed:", err);
     alert("写真の読み込みに失敗しました: " + err.message);
   }
 });
+
+// -----------------------------------------------------------------
+// ★v6.6: 元の写真(撮影したままの高画質)をiPadに保存する
+//   ページには縮小して貼るだけなので、元の写真は「写真を使用」の後に保存待ちリストに入れ、
+//   右下の「元の写真を保存(N枚)」ボタンで共有画面(navigator.share)を開いて「画像を保存」してもらう。
+//   (共有画面はタップの直後でないと開けないため、撮影後に自動では開かずボタンを出す)
+//   共有画面を開けない端末では、写真を1枚ずつ表示して長押しで保存してもらう。
+//   保存待ちの写真はメモリ上だけに持つ(アプリを閉じる・再読み込みすると消える)。
+// -----------------------------------------------------------------
+let origQueue = [];   // [{ file, label }]
+
+function origFileName(page, wheel, file) {
+  const d = new Date();
+  const p2 = (n) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+  const ext = (file.type === "image/png") ? "png" : (file.type === "image/heic" ? "heic" : "jpg");
+  return `TPU_P${pages.indexOf(page) + 1}_${wheel}_${stamp}.${ext}`;
+}
+
+function queueOriginalPhoto(file, page, wheel) {
+  const name = origFileName(page, wheel, file);
+  let f = file;
+  try { f = new File([file], name, { type: file.type || "image/jpeg" }); } catch (_) { /* 古いブラウザ: 名前はそのまま */ }
+  origQueue.push({ file: f, label: `P${pages.indexOf(page) + 1} ${wheel}` });
+  renderOrigSaveBar();
+}
+
+function renderOrigSaveBar() {
+  const bar = el("origSaveBar");
+  if (origQueue.length === 0) { bar.classList.remove("show"); return; }
+  el("origSaveBtn").textContent = origQueue.length === 1
+    ? `元の写真を保存 (${origQueue[0].label})` : `元の写真を保存 (${origQueue.length}枚)`;
+  bar.classList.add("show");
+}
+
+async function onOrigSaveClick() {
+  if (origQueue.length === 0) return;
+  const files = origQueue.map(q => q.file);
+  const canShareFiles = !!(navigator.share && navigator.canShare && navigator.canShare({ files }));
+  if (canShareFiles) {
+    try {
+      await navigator.share({ files });
+      origQueue = [];            // 共有画面で保存(または他のアプリへ送信)が済んだ
+      renderOrigSaveBar();
+      return;
+    } catch (err) {
+      if (err && err.name === "AbortError") return;   // キャンセル → 保存待ちのまま残す
+      console.warn("[TPU-MINI handwriting] share failed, fallback to long-press:", err);
+    }
+  }
+  openOrigViewer();   // 共有画面が使えない → 長押しで保存してもらう
+}
+
+let origViewUrl = null;
+function openOrigViewer() {
+  if (origQueue.length === 0) { closeOrigViewer(); return; }
+  if (origViewUrl) URL.revokeObjectURL(origViewUrl);
+  origViewUrl = URL.createObjectURL(origQueue[0].file);
+  el("origViewImg").src = origViewUrl;
+  el("origViewNext").textContent = origQueue.length > 1 ? `保存した → 次の写真 (残り${origQueue.length - 1}枚)` : "保存した";
+  el("origViewModal").style.display = "flex";
+}
+function onOrigViewNext() {          // 表示中の1枚を保存済みとしてリストから外す
+  origQueue.shift();
+  renderOrigSaveBar();
+  if (origQueue.length) openOrigViewer(); else closeOrigViewer();
+}
+function closeOrigViewer() {
+  el("origViewModal").style.display = "none";
+  if (origViewUrl) { URL.revokeObjectURL(origViewUrl); origViewUrl = null; }
+}
+function onOrigDismiss() {
+  if (!confirm(`保存していない元の写真(${origQueue.length}枚)を破棄しますか？\n(ページに貼った写真はそのまま残ります)`)) return;
+  origQueue = [];
+  renderOrigSaveBar();
+}
 
 // -----------------------------------------------------------------
 // IndexedDBへの保存・復元(各ページをPNGビットマップとして保存する簡易方式)
@@ -1802,6 +1912,11 @@ async function init() {
   });
 
   el("photoViewClose").addEventListener("click", closePhotoViewer);
+  // ★v6.6: 元の写真の保存
+  el("origSaveBtn").addEventListener("click", onOrigSaveClick);
+  el("origSaveDismiss").addEventListener("click", onOrigDismiss);
+  el("origViewNext").addEventListener("click", onOrigViewNext);
+  el("origViewClose").addEventListener("click", closeOrigViewer);
   el("photoViewRetake").addEventListener("click", () => {
     const target = photoViewTarget;
     closePhotoViewer();
